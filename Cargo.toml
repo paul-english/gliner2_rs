@@ -2,15 +2,23 @@
 name = "gliner2"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Rust implementation of GLiNER2 with compatibility for upstream weights and Python training output."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/paul-english/gliner2_rs"
 default-run = "gliner2"
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/src/*.rs",
+]
 
 [workspace]
-members = ["harness_compare"]
+members = ["harness_compare", "scripts/list_keys"]
 resolver = "2"
-
-[[bin]]
-name = "list_keys"
-path = "list_keys.rs"
 
 [dependencies]
 candle-core = "0.8"

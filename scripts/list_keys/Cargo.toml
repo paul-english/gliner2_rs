@@ -1,0 +1,12 @@
+[package]
+name = "list-keys"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "list_keys"
+path = "src/main.rs"
+
+[dependencies]
+candle-core = "0.8"

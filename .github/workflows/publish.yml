@@ -1,0 +1,34 @@
+# Publish gliner2 to crates.io when a GitHub Release is published.
+# docs.rs builds API docs automatically after each successful publish.
+#
+# Required repository secret: CRATES_IO_TOKEN (crates.io API token with publish scope).
+
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  crates-io:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo doc
+        run: cargo doc -p gliner2 --no-deps
+
+      - name: cargo publish (dry run)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p gliner2 --dry-run
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p gliner2

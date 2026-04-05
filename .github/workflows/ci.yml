@@ -33,6 +33,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: cargo doc
+        run: cargo doc -p gliner2 --no-deps
+
       - name: cargo test
         run: cargo test --workspace
 
