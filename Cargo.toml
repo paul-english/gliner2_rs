@@ -1,0 +1,26 @@
+[package]
+name = "gliner2"
+version = "0.1.0"
+edition = "2024"
+default-run = "gliner2"
+
+[workspace]
+members = ["harness_compare"]
+resolver = "2"
+
+[[bin]]
+name = "list_keys"
+path = "list_keys.rs"
+
+[dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = "0.4"
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

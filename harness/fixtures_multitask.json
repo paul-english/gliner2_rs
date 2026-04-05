@@ -1,0 +1,24 @@
+[
+  {
+    "id": "entities_plus_sentiment",
+    "text": "Apple released iPhone 15 in Cupertino.",
+    "threshold": 0.5,
+    "schema": {
+      "json_structures": [],
+      "entities": {
+        "company": "",
+        "product": ""
+      },
+      "relations": [],
+      "classifications": [
+        {
+          "task": "sentiment",
+          "labels": ["positive", "negative", "neutral"],
+          "multi_label": false,
+          "cls_threshold": 0.5,
+          "true_label": ["N/A"]
+        }
+      ]
+    }
+  }
+]

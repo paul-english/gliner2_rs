@@ -1,0 +1,26 @@
+[
+  {
+    "id": "steve_jobs",
+    "text": "Steve Jobs founded Apple in Cupertino.",
+    "entity_types": ["person", "company", "location"],
+    "threshold": 0.5
+  },
+  {
+    "id": "tim_cook_iphone",
+    "text": "Apple CEO Tim Cook announced the iPhone 15 launch in Cupertino on September 12.",
+    "entity_types": ["company", "person", "product", "location", "date"],
+    "threshold": 0.5
+  },
+  {
+    "id": "sundar_pichai",
+    "text": "Google's Sundar Pichai spoke at the conference in Mountain View.",
+    "entity_types": ["company", "person", "product", "location"],
+    "threshold": 0.5
+  },
+  {
+    "id": "microsoft_windows",
+    "text": "Microsoft released Windows 11 in Redmond.",
+    "entity_types": ["company", "person", "product", "location"],
+    "threshold": 0.5
+  }
+]

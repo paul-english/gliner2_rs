@@ -1,0 +1,14 @@
+[project]
+name = "gliner2-harness"
+version = "0.1.0"
+description = "Python baseline runner for GLiNER2 Rust comparison harness"
+readme = false
+requires-python = ">=3.10"
+dependencies = [
+    "gliner2",
+    "requests>=2",
+    "urllib3>=2",
+]
+
+[tool.uv]
+package = false
