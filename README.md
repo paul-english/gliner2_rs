@@ -14,7 +14,7 @@ cargo install gliner2
 
 ## Recorded speed (comparison harness)
 
-The `[harness/](harness/)` scripts run the same **release** Rust binaries (`harness_compare`, `harness_compare_mt` on CPU) against the PyPI `gliner2` package. Timing fields are wall-clock milliseconds from a single process: `load_model_ms` is one-time load; `infer_ms` is per-fixture forward work (entity harness sums all cases for the total row).
+The [harness/](harness/) scripts run the same **release** Rust binaries (`harness_compare`, `harness_compare_mt` on CPU) against the PyPI `gliner2` package. Timing fields are wall-clock milliseconds from a single process: `load_model_ms` is one-time load; `infer_ms` is per-fixture forward work (entity harness sums all cases for the total row).
 
 **Reproduce (CPU vs CPU):** from the repo root, with Hugging Face access for the default model:
 
@@ -34,7 +34,7 @@ For **apples-to-apples timing** with the Rust single-forward path, Python uses `
 
 Model: `fastino/gliner2-base-v1`. **Recorded:** 2026-04-05 (Linux x86_64, local run; numbers vary by machine and load).
 
-**Entity harness** (`[harness/fixtures.json](harness/fixtures.json)`) — metadata and per-case infer times:
+**Entity harness** ([harness/fixtures.json](harness/fixtures.json)) — metadata and per-case infer times:
 
 
 |                              | Rust  | Python     |
@@ -54,7 +54,7 @@ Model: `fastino/gliner2-base-v1`. **Recorded:** 2026-04-05 (Linux x86_64, local 
 | `microsoft_windows` | 134.4           | 75.4              | 0.561×        |
 
 
-**Multitask harness** (`[harness/fixtures_multitask.json](harness/fixtures_multitask.json)`) — single fixture `entities_plus_sentiment`:
+**Multitask harness** ([harness/fixtures_multitask.json](harness/fixtures_multitask.json)) — single fixture `entities_plus_sentiment`:
 
 
 |                             | Rust  | Python     |
@@ -69,16 +69,16 @@ These are **short-fixture** timings. Update the tables when you change the model
 
 ### Throughput (local only; not in CI)
 
-**These benchmarks are not run in GitHub Actions** (see `[.github/workflows/ci.yml](.github/workflows/ci.yml)`). Run them on your machine when you need larger-sample timing.
+**These benchmarks are not run in GitHub Actions** (see [.github/workflows/ci.yml](.github/workflows/ci.yml)). Run them on your machine when you need larger-sample timing.
 
-The harness uses **64 samples** by default, built by cycling texts from `[harness/fixtures.json](harness/fixtures.json)`. Every sample uses the same entity label list `["company", "person", "product", "location", "date"]` so Rust `[batch_extract_entities](src/extract.rs)` and PyPI `batch_extract_entities` can process the full set with `**batch_size=64`**. **Sequential rows** use **64× micro-batches of size 1** on both sides (Rust’s `forward` loop vs Python `batch_extract_entities([t], …, batch_size=1)`). **Batched rows** use one logical batch of 64 on each side.
+The harness uses **64 samples** by default, built by cycling texts from [harness/fixtures.json](harness/fixtures.json). Every sample uses the same entity label list `["company", "person", "product", "location", "date"]` so Rust [batch_extract_entities](src/extract.rs) and PyPI `batch_extract_entities` can process the full set with `**batch_size=64`**. **Sequential rows** use **64× micro-batches of size 1** on both sides (Rust’s `forward` loop vs Python `batch_extract_entities([t], …, batch_size=1)`). **Batched rows** use one logical batch of 64 on each side.
 
 ```bash
 uv sync --locked --directory harness
 bash harness/run_throughput.sh
 ```
 
-Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [rust_batch_out.json] [samples]`. The script runs `[harness/compare_throughput.py](harness/compare_throughput.py)` on the three JSON outputs.
+Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [rust_batch_out.json] [samples]`. The script runs [harness/compare_throughput.py](harness/compare_throughput.py) on the three JSON outputs.
 
 **Recorded:** 2026-04-05 (Linux x86_64, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=2` over all samples before each timed pass.
 
@@ -93,7 +93,7 @@ Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [r
 
 Load times from that run: Rust sequential ~492 ms, Rust batched ~467 ms, Python ~2613 ms.
 
-Re-run `bash harness/run_throughput.sh` to refresh; the script prints the same layout via `[harness/compare_throughput.py](harness/compare_throughput.py)`.
+Re-run `bash harness/run_throughput.sh` to refresh; the script prints the same layout via [harness/compare_throughput.py](harness/compare_throughput.py).
 
 ### GPU vs GPU (not recorded yet)
 
@@ -449,7 +449,7 @@ If you must commit before fixing Clippy, you can skip that hook: `SKIP=cargo-cli
 
 The command-line interface is **not implemented yet**. This section specifies the intended `gliner2` binary (see `default-run` in `Cargo.toml`) so future work can match the library API and Python `GLiNER2` behavior.
 
-Install the binary with `cargo install gliner2`. Inference flags mirror `[ExtractOptions](src/extract.rs)` (`threshold`, `format_results`, `include_confidence`, `include_spans`, `max_len`).
+Install the binary with `cargo install gliner2`. Inference flags mirror [ExtractOptions](src/extract.rs) (`threshold`, `format_results`, `include_confidence`, `include_spans`, `max_len`).
 
 ### Command overview
 
@@ -491,7 +491,7 @@ These apply to every subcommand unless stated otherwise.
 | Flag                                                       | Description                                                                                                                                                       |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--model <HF_REPO_ID>`                                     | Hugging Face model id (default: `fastino/gliner2-base-v1`, same as `harness/` scripts).                                                                           |
-| `--model-dir <DIR>`                                        | Offline layout: `config.json`, `encoder_config/config.json`, `tokenizer.json`, `model.safetensors` (matches `ModelFiles` from `[download_model](src/config.rs)`). |
+| `--model-dir <DIR>`                                        | Offline layout: `config.json`, `encoder_config/config.json`, `tokenizer.json`, `model.safetensors` (matches `ModelFiles` from [download_model](src/config.rs)). |
 | `--config`, `--encoder-config`, `--tokenizer`, `--weights` | Explicit paths instead of `--model` / `--model-dir`.                                                                                                              |
 | `-q`, `-v` / `--log-level`                                 | Quiet / verbose logging (exact mapping is implementation-defined).                                                                                                |
 
@@ -608,17 +608,17 @@ Do not pass both repeatable `--relation` and `--relations-json`.
 | `--structures-json '<OBJECT>'` | Same object inline.                                              |
 
 
-Field specs use the same grammar as **Structured JSON (`extract_json`)** above: strings like `name::dtype::[choices]::description` or JSON objects parsed by `[parse_field_spec](src/schema.rs)`. Do not pass both `--structures` and `--structures-json`.
+Field specs use the same grammar as **Structured JSON (`extract_json`)** above: strings like `name::dtype::[choices]::description` or JSON objects parsed by [parse_field_spec](src/schema.rs). Do not pass both `--structures` and `--structures-json`.
 
 #### `gliner2 run`
 
 
 | Flag                   | Description                                                                                                                                                                                                                                                                                                             |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--schema-file <PATH>` | Required. Full **engine** multitask schema (same shape as Python `GLiNER2.extract(text, schema)`). See `[harness/fixtures_multitask.json](harness/fixtures_multitask.json)` for a minimal example: `entities`, `classifications`, `relations`, `json_structures`, optional `entity_descriptions` / `json_descriptions`. |
+| `--schema-file <PATH>` | Required. Full **engine** multitask schema (same shape as Python `GLiNER2.extract(text, schema)`). See [harness/fixtures_multitask.json](harness/fixtures_multitask.json) for a minimal example: `entities`, `classifications`, `relations`, `json_structures`, optional `entity_descriptions` / `json_descriptions`. |
 
 
-Each entry in `classifications` should include `"true_label": ["N/A"]` when mirroring Python; the harness script `[harness/run_multitask_python.py](harness/run_multitask_python.py)` sets this if missing.
+Each entry in `classifications` should include `"true_label": ["N/A"]` when mirroring Python; the harness script [harness/run_multitask_python.py](harness/run_multitask_python.py) sets this if missing.
 
 ### Environment
 
