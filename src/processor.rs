@@ -38,7 +38,7 @@ pub const E_TOKEN: &str = "[E]";
 
 impl SchemaTransformer {
     pub fn new(tokenizer_path: &str) -> Result<Self> {
-        let mut tokenizer = Tokenizer::from_file(tokenizer_path)
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
         
         // Add special tokens if they are not already there

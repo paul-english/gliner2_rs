@@ -7,7 +7,6 @@ pub struct SpanMarkerV0 {
     project_end: Sequential,
     out_project: Sequential,
     max_width: usize,
-    hidden_size: usize,
 }
 
 impl SpanMarkerV0 {
@@ -22,7 +21,6 @@ impl SpanMarkerV0 {
             project_end,
             out_project,
             max_width,
-            hidden_size,
         })
     }
 
@@ -52,7 +50,7 @@ impl SpanMarkerV0 {
         // idx: [B, S]
         // result: [B, S, D]
         
-        let (b, l, d) = h.dims3()?;
+        let (b, _l, d) = h.dims3()?;
         let s = idx.dim(1)?;
         
         // We need to gather across L dimension for each B and D.

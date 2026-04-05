@@ -7,7 +7,7 @@ pub fn create_mlp(
     in_dim: usize,
     intermediate_dims: &[usize],
     out_dim: usize,
-    dropout: f32,
+    _dropout: f32,
     activation: Activation,
     vb: VarBuilder,
 ) -> Result<Sequential> {
@@ -291,7 +291,6 @@ pub struct CompileSafeGRU {
     weight_hh_l0: Tensor,
     bias_ih_l0: Tensor,
     bias_hh_l0: Tensor,
-    hidden_size: usize,
 }
 
 impl CompileSafeGRU {
@@ -306,7 +305,6 @@ impl CompileSafeGRU {
             weight_hh_l0,
             bias_ih_l0,
             bias_hh_l0,
-            hidden_size,
         })
     }
 
@@ -340,7 +338,6 @@ pub struct CountLSTM {
     pos_embedding: Embedding,
     gru: CompileSafeGRU,
     projector: Sequential,
-    hidden_size: usize,
     max_count: usize,
 }
 
@@ -361,7 +358,6 @@ impl CountLSTM {
             pos_embedding,
             gru,
             projector,
-            hidden_size,
             max_count,
         })
     }
