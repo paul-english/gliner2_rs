@@ -1,5 +1,9 @@
 # Gliner2 Rust
 
+[![Latest version](https://img.shields.io/crates/v/gliner2.svg)](https://crates.io/crates/gliner2)
+[![Documentation](https://docs.rs/gliner2/badge.svg)](https://docs.rs/gliner2)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/gliner2/blob/main/LICENSE)
+
 This project implements the Gliner2 model in rust with compatibility to the original weights and output of the python training.
 
 ```bash
