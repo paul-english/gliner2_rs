@@ -1,6 +1,6 @@
 ---
 id: gli-jhz7
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-05T14:25:03Z
