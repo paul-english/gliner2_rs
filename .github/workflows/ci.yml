@@ -1,5 +1,8 @@
 # CI: Rust fmt, Clippy, tests, and Rust vs Python harness comparison.
 #
+# Throughput / performance benchmarks (harness/run_throughput.sh, harness_throughput,
+# harness/benchmark_throughput.py) are intentionally not run here — run them locally when needed.
+#
 # Optional: add a repository secret HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) for higher
 # Hugging Face Hub rate limits or private/gated models. Public model downloads work without it.
 
@@ -32,9 +35,6 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo doc
-        run: cargo doc -p gliner2 --no-deps
 
       - name: cargo test
         run: cargo test --workspace

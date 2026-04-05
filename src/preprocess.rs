@@ -28,6 +28,51 @@ impl TaskType {
     }
 }
 
+/// Padded batch of [`PreprocessedInput`] for a single encoder forward pass.
+///
+/// `input_ids` and `attention_mask` are row-major `[batch_size * max_seq_len]`.
+/// Padding uses id `0`, matching Python `torch.zeros` collate.
+#[derive(Debug, Clone)]
+pub struct PreprocessedBatch {
+    pub batch_size: usize,
+    pub max_seq_len: usize,
+    pub input_ids: Vec<u32>,
+    /// `1` = real token, `0` = pad (stored as `u32` for tensor construction).
+    pub attention_mask: Vec<u32>,
+    /// Per-sample fields; `input_ids` here are the **unpadded** originals (batch path uses [`PreprocessedBatch::input_ids`]).
+    pub samples: Vec<PreprocessedInput>,
+}
+
+/// Pad a slice of preprocessed records to `PreprocessedBatch`. Returns `None` if `samples` is empty.
+pub fn collate_preprocessed(samples: &[PreprocessedInput]) -> Option<PreprocessedBatch> {
+    if samples.is_empty() {
+        return None;
+    }
+    let batch_size = samples.len();
+    let max_seq_len = samples
+        .iter()
+        .map(|s| s.input_ids.len())
+        .max()
+        .unwrap_or(0);
+    let mut input_ids = vec![0u32; batch_size * max_seq_len];
+    let mut attention_mask = vec![0u32; batch_size * max_seq_len];
+    for (i, s) in samples.iter().enumerate() {
+        let len = s.input_ids.len();
+        let row_off = i * max_seq_len;
+        input_ids[row_off..row_off + len].copy_from_slice(&s.input_ids);
+        for j in 0..len {
+            attention_mask[row_off + j] = 1;
+        }
+    }
+    Some(PreprocessedBatch {
+        batch_size,
+        max_seq_len,
+        input_ids,
+        attention_mask,
+        samples: samples.to_vec(),
+    })
+}
+
 /// Single-sample preprocessed input for `Extractor::extract_preprocessed`.
 #[derive(Debug, Clone)]
 pub struct PreprocessedInput {
@@ -548,4 +593,48 @@ fn process_classifications(
         types.push(TaskType::Classifications);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PreprocessedInput, TaskType, collate_preprocessed};
+    use serde_json::json;
+
+    fn dummy_pre(seq_len: usize, id_base: u32) -> PreprocessedInput {
+        PreprocessedInput {
+            input_ids: (0..seq_len as u32).map(|i| id_base + i).collect(),
+            text_word_first_positions: vec![0],
+            schema_special_indices: vec![],
+            schema_tokens_list: vec![],
+            task_types: vec![TaskType::Classifications],
+            text_tokens: vec![],
+            start_mappings: vec![],
+            end_mappings: vec![],
+            original_text: String::new(),
+            len_prefix: 0,
+            schema_working: json!({}),
+            schema_original: json!({}),
+        }
+    }
+
+    #[test]
+    fn collate_empty_returns_none() {
+        assert!(collate_preprocessed(&[]).is_none());
+    }
+
+    #[test]
+    fn collate_pads_to_max_length() {
+        let a = dummy_pre(3, 10);
+        let b = dummy_pre(5, 100);
+        let batch = collate_preprocessed(&[a, b]).unwrap();
+        assert_eq!(batch.batch_size, 2);
+        assert_eq!(batch.max_seq_len, 5);
+        assert_eq!(batch.input_ids.len(), 10);
+        assert_eq!(batch.attention_mask, vec![
+            1, 1, 1, 0, 0, //
+            1, 1, 1, 1, 1,
+        ]);
+        assert_eq!(&batch.input_ids[0..3], &[10, 11, 12]);
+        assert_eq!(&batch.input_ids[5..10], &[100, 101, 102, 103, 104]);
+    }
 }

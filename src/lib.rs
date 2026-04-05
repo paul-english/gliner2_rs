@@ -10,9 +10,11 @@ pub mod span_rep;
 
 pub use config::ExtractorConfig;
 pub use decode::Entity;
-pub use extract::{ExtractOptions, extract_with_schema};
+pub use extract::{
+    BatchSchemaMode, ExtractOptions, batch_extract, extract_from_preprocessed, extract_with_schema,
+};
 pub use model::Extractor;
-pub use preprocess::{PreprocessedInput, TaskType};
+pub use preprocess::{PreprocessedBatch, PreprocessedInput, TaskType, collate_preprocessed};
 pub use processor::SchemaTransformer;
 pub use schema::{
     ExtractionMetadata, ParsedFieldSpec, Schema, StructureBuilder, ValueDtype, create_schema,

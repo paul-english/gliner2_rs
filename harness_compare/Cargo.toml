@@ -10,6 +10,10 @@ default-run = "harness_compare"
 name = "harness_compare_mt"
 path = "src/mt_main.rs"
 
+[[bin]]
+name = "harness_throughput"
+path = "src/throughput_main.rs"
+
 [dependencies]
 gliner2 = { path = ".." }
 anyhow = "1"

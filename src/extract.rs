@@ -1,7 +1,7 @@
 //! Multi-task extraction and `format_results` aligned with `gliner2.inference.engine`.
 
 use crate::Extractor;
-use crate::preprocess::TaskType;
+use crate::preprocess::{PreprocessedInput, TaskType, collate_preprocessed};
 use crate::processor::SchemaTransformer;
 use crate::schema::ExtractionMetadata;
 use anyhow::{Context, Result};
@@ -17,6 +17,8 @@ pub struct ExtractOptions {
     pub include_confidence: bool,
     pub include_spans: bool,
     pub max_len: Option<usize>,
+    /// Chunk size for [`Extractor::batch_extract`] and related batch APIs (Python default: 8).
+    pub batch_size: usize,
 }
 
 // Nested indices mirror row-major layout from flat[idx]; iterator/clippy refactors obscure that mapping.
@@ -54,30 +56,52 @@ impl Default for ExtractOptions {
             include_confidence: false,
             include_spans: false,
             max_len: None,
+            batch_size: 8,
         }
     }
 }
 
-/// End-to-end extract: preprocess → encode → heads → optional `format_results`.
-pub fn extract_with_schema(
+/// How schemas and metadata map to each text in [`batch_extract`].
+#[derive(Clone, Copy, Debug)]
+pub enum BatchSchemaMode<'a> {
+    /// One schema and metadata shared by every text in the batch.
+    Shared {
+        schema: &'a Value,
+        meta: &'a ExtractionMetadata,
+    },
+    /// Per-text schema and metadata (`len` must match `texts.len()`).
+    PerSample {
+        schemas: &'a [Value],
+        metas: &'a [ExtractionMetadata],
+    },
+}
+
+fn sample_needs_span_rep(pre: &PreprocessedInput) -> bool {
+    pre.task_types.iter().any(|t| {
+        matches!(
+            t,
+            TaskType::Entities | TaskType::Relations | TaskType::JsonStructures
+        )
+    })
+}
+
+/// Decode from one sample’s encoder output and optional span tensor (multi-task heads + `format_results`).
+pub fn extract_from_preprocessed(
     extractor: &Extractor,
-    transformer: &SchemaTransformer,
-    text: &str,
-    schema: &Value,
+    pre: &PreprocessedInput,
+    last_hidden_seq: &Tensor,
+    span_rep: Option<&Tensor>,
     meta: &ExtractionMetadata,
     opts: &ExtractOptions,
 ) -> Result<Value> {
-    let pre = transformer.transform_extract(text, schema, opts.max_len)?;
-    let device = Device::Cpu;
-    let input_ids = Tensor::new(pre.input_ids.clone(), &device)?.unsqueeze(0)?;
-    let attention_mask = Tensor::ones(input_ids.dims(), DType::I64, &device)?;
+    let span_for_tasks: Option<&Tensor> = if sample_needs_span_rep(pre) {
+        Some(
+            span_rep.context("extract_from_preprocessed: span_rep required for span tasks")?,
+        )
+    } else {
+        None
+    };
 
-    let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
-    let text_embs =
-        extractor.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
-    let span_rep = extractor.compute_span_rep(&text_embs)?;
-
-    let last_hidden = hidden.get(0)?;
     let l_words = pre.text_word_first_positions.len();
     let text_len = pre.start_mappings.len();
     let len_prefix = pre.len_prefix;
@@ -102,7 +126,7 @@ pub fn extract_with_schema(
 
         let mut embs = Vec::new();
         for &p in &positions {
-            embs.push(last_hidden.get(p)?);
+            embs.push(last_hidden_seq.get(p)?);
         }
         let embs = Tensor::stack(&embs, 0)?;
 
@@ -124,7 +148,7 @@ pub fn extract_with_schema(
                     "entities",
                     &schema_tokens,
                     &embs,
-                    &span_rep,
+                    span_for_tasks.expect("span task without tensor"),
                     task_type,
                     l_words,
                     text_len,
@@ -148,7 +172,7 @@ pub fn extract_with_schema(
                     &name,
                     &schema_tokens,
                     &embs,
-                    &span_rep,
+                    span_for_tasks.expect("span task without tensor"),
                     task_type,
                     l_words,
                     text_len,
@@ -172,7 +196,7 @@ pub fn extract_with_schema(
                     &name,
                     &schema_tokens,
                     &embs,
-                    &span_rep,
+                    span_for_tasks.expect("span task without tensor"),
                     task_type,
                     l_words,
                     text_len,
@@ -202,6 +226,155 @@ pub fn extract_with_schema(
         Value::Object(raw)
     };
     Ok(out)
+}
+
+/// End-to-end extract: preprocess → encode → heads → optional `format_results`.
+pub fn extract_with_schema(
+    extractor: &Extractor,
+    transformer: &SchemaTransformer,
+    text: &str,
+    schema: &Value,
+    meta: &ExtractionMetadata,
+    opts: &ExtractOptions,
+) -> Result<Value> {
+    let pre = transformer.transform_extract(text, schema, opts.max_len)?;
+    let device = Device::Cpu;
+    let input_ids = Tensor::new(pre.input_ids.clone(), &device)?.unsqueeze(0)?;
+    let attention_mask = Tensor::ones(input_ids.dims(), DType::I64, &device)?;
+
+    let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
+    let text_embs =
+        extractor.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
+    let span_rep = extractor.compute_span_rep(&text_embs)?;
+
+    let last_hidden = hidden.get(0)?;
+    let span_opt = sample_needs_span_rep(&pre).then_some(&span_rep);
+    extract_from_preprocessed(
+        extractor,
+        &pre,
+        &last_hidden,
+        span_opt,
+        meta,
+        opts,
+    )
+}
+
+/// Batch extract with Python `batch_extract` semantics: padded encoder passes, batched span rep, per-sample decode.
+pub fn batch_extract(
+    extractor: &Extractor,
+    transformer: &SchemaTransformer,
+    texts: &[String],
+    mode: BatchSchemaMode<'_>,
+    opts: &ExtractOptions,
+) -> Result<Vec<Value>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match mode {
+        BatchSchemaMode::PerSample { schemas, metas } => {
+            anyhow::ensure!(
+                schemas.len() == texts.len(),
+                "batch_extract: schemas.len() ({}) != texts.len() ({})",
+                schemas.len(),
+                texts.len()
+            );
+            anyhow::ensure!(
+                metas.len() == texts.len(),
+                "batch_extract: metas.len() ({}) != texts.len() ({})",
+                metas.len(),
+                texts.len()
+            );
+        }
+        BatchSchemaMode::Shared { .. } => {}
+    }
+
+    let device = Device::Cpu;
+    let bs = opts.batch_size.max(1);
+    let mut all_out = Vec::with_capacity(texts.len());
+    let mut base = 0usize;
+
+    for chunk in texts.chunks(bs) {
+        let mut pres = Vec::with_capacity(chunk.len());
+        let mut metas_chunk: Vec<&ExtractionMetadata> = Vec::with_capacity(chunk.len());
+        for (j, text) in chunk.iter().enumerate() {
+            let global = base + j;
+            let (schema, meta) = match mode {
+                BatchSchemaMode::Shared { schema, meta } => (schema, meta),
+                BatchSchemaMode::PerSample { schemas, metas } => {
+                    (&schemas[global], &metas[global])
+                }
+            };
+            let pre = transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
+            pres.push(pre);
+            metas_chunk.push(meta);
+        }
+
+        let batch = collate_preprocessed(&pres).expect("non-empty chunk");
+        let input_ids = Tensor::from_vec(
+            batch.input_ids.clone(),
+            (batch.batch_size, batch.max_seq_len),
+            &device,
+        )?;
+        let mask_i64: Vec<i64> = batch
+            .attention_mask
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let attention_mask = Tensor::from_vec(
+            mask_i64,
+            (batch.batch_size, batch.max_seq_len),
+            &device,
+        )?;
+
+        let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
+
+        let mut span_emb_list: Vec<Tensor> = Vec::new();
+        let mut span_orig_index: Vec<usize> = Vec::new();
+        for (i, pre) in batch.samples.iter().enumerate() {
+            if sample_needs_span_rep(pre) {
+                let tw = extractor.gather_text_word_embeddings_batch_idx(
+                    &hidden,
+                    i,
+                    &pre.text_word_first_positions,
+                )?;
+                span_orig_index.push(i);
+                span_emb_list.push(tw);
+            }
+        }
+
+        let batched_spans = if span_emb_list.is_empty() {
+            vec![]
+        } else {
+            extractor.compute_span_rep_batched(&span_emb_list)?
+        };
+
+        let mut span_by_sample: Vec<Option<Tensor>> = (0..batch.batch_size).map(|_| None).collect();
+        for (k, &orig_i) in span_orig_index.iter().enumerate() {
+            span_by_sample[orig_i] = Some(batched_spans[k].clone());
+        }
+
+        for i in 0..batch.batch_size {
+            let pre = &batch.samples[i];
+            let last_h = hidden.get(i)?;
+            let meta = metas_chunk[i];
+            let span_ref: Option<&Tensor> = if sample_needs_span_rep(pre) {
+                Some(
+                    span_by_sample[i]
+                        .as_ref()
+                        .context("internal: missing batched span rep")?,
+                )
+            } else {
+                None
+            };
+            let v = extract_from_preprocessed(extractor, pre, &last_h, span_ref, meta, opts)?;
+            all_out.push(v);
+        }
+
+        base += chunk.len();
+    }
+
+    Ok(all_out)
 }
 
 fn schema_prompt_raw(tokens: &[String]) -> String {
@@ -1104,6 +1277,99 @@ impl Extractor {
         opts: &ExtractOptions,
     ) -> Result<Value> {
         extract_with_schema(self, transformer, text, schema, meta, opts)
+    }
+
+    /// [`batch_extract`] with a single shared schema (Python `batch_extract` with one schema dict).
+    pub fn batch_extract(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        schema: &Value,
+        meta: &ExtractionMetadata,
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        batch_extract(
+            self,
+            transformer,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+        )
+    }
+
+    /// [`batch_extract`] with per-text schemas and metadata.
+    pub fn batch_extract_per_sample(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        schemas: &[Value],
+        metas: &[ExtractionMetadata],
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        batch_extract(
+            self,
+            transformer,
+            texts,
+            BatchSchemaMode::PerSample { schemas, metas },
+            opts,
+        )
+    }
+
+    pub fn batch_extract_entities(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        entity_types: &[String],
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        let mut s = crate::schema::Schema::new();
+        let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
+        s.entities(Value::Array(types));
+        let (schema_val, meta) = s.build();
+        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+    }
+
+    pub fn batch_classify_text(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        task: &str,
+        labels: Value,
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        let mut s = crate::schema::Schema::new();
+        s.classification_simple(task, labels);
+        let (schema_val, meta) = s.build();
+        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+    }
+
+    pub fn batch_extract_relations(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        relation_types: Value,
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        let mut s = crate::schema::Schema::new();
+        s.relations(relation_types);
+        let (schema_val, meta) = s.build();
+        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+    }
+
+    pub fn batch_extract_json(
+        &self,
+        transformer: &SchemaTransformer,
+        texts: &[String],
+        structures: &Value,
+        opts: &ExtractOptions,
+    ) -> Result<Vec<Value>> {
+        let obj = structures.as_object().context(
+            "batch_extract_json: structures must be a JSON object (parent → field spec array)",
+        )?;
+        let mut s = crate::schema::Schema::new();
+        s.extract_json_structures(obj)?;
+        let (schema_val, meta) = s.build();
+        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
     }
 
     pub fn extract_entities(

@@ -56,6 +56,10 @@ def deep_compare(
     return lines, True
 
 
+def _ms(x: Any) -> float:
+    return float(x) if x is not None else 0.0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("rust_json")
@@ -70,8 +74,14 @@ def main() -> int:
         py = json.load(f)
 
     print("--- metadata ---")
-    print(f"rust:   {rust.get('runner')} {rust.get('model_id')}")
-    print(f"python: {py.get('runner')} {py.get('model_id')}")
+    print(
+        f"rust:   runner={rust.get('runner')} model_id={rust.get('model_id')} "
+        f"device={rust.get('device_note')} load_ms={_ms(rust.get('load_model_ms')):.3f}"
+    )
+    print(
+        f"python: runner={py.get('runner')} model_id={py.get('model_id')} "
+        f"device={py.get('device_note')} load_ms={_ms(py.get('load_model_ms')):.3f}"
+    )
 
     r_cases = {c["id"]: c for c in rust.get("cases", [])}
     p_cases = {c["id"]: c for c in py.get("cases", [])}
@@ -91,6 +101,23 @@ def main() -> int:
         if sk and not sl:
             print("  result: OK")
         all_ok = all_ok and sk
+
+        r_ms = float(rc.get("infer_ms", 0))
+        p_ms = float(pc.get("infer_ms", 0))
+        ratio = (p_ms / r_ms) if r_ms > 0 else float("inf")
+        print(
+            f"  timing: rust infer_ms={r_ms:.3f} python infer_ms={p_ms:.3f} "
+            f"(python/rust={ratio:.3f}x)"
+        )
+
+    r_total = sum(float(c.get("infer_ms", 0)) for c in rust.get("cases", []))
+    p_total = sum(float(c.get("infer_ms", 0)) for c in py.get("cases", []))
+    print()
+    print("--- total infer_ms (sum of cases) ---")
+    print(
+        f"rust: {r_total:.3f}  python: {p_total:.3f}  "
+        f"ratio: {(p_total / r_total if r_total else float('inf')):.3f}x"
+    )
 
     if args.warn_only:
         return 0

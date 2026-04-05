@@ -9,5 +9,5 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 
 (cd "$ROOT" && cargo build -q --release -p harness_compare --bin harness_compare_mt \
   && "$CARGO_TARGET_DIR/release/harness_compare_mt" "$FIXTURES") >"$RUST_OUT"
-(cd "$ROOT/harness" && uv run python run_multitask_python.py --fixtures "$FIXTURES") >"$PY_OUT"
+(cd "$ROOT/harness" && env CUDA_VISIBLE_DEVICES= uv run python run_multitask_python.py --fixtures "$FIXTURES" --device cpu) >"$PY_OUT"
 (cd "$ROOT/harness" && uv run python compare_mt.py "$RUST_OUT" "$PY_OUT")

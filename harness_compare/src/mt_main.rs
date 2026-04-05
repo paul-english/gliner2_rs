@@ -81,6 +81,7 @@ fn main() -> Result<()> {
             include_confidence: false,
             include_spans: false,
             max_len: None,
+            batch_size: 8,
         };
 
         let infer_start = Instant::now();

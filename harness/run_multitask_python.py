@@ -17,6 +17,12 @@ def main() -> int:
     p.add_argument("--fixtures", required=True, help="fixtures_multitask.json")
     p.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     p.add_argument("--out", default="-")
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu"),
+        default="auto",
+        help="auto: use CUDA when available; cpu: load and run on CPU (harness CPU-vs-CPU)",
+    )
     args = p.parse_args()
 
     try:
@@ -25,9 +31,16 @@ def main() -> int:
         print("error: torch required", file=sys.stderr)
         return 1
 
-    device_note = (
-        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    )
+    if args.device == "cpu":
+        map_location: str | None = "cpu"
+        device_note = "cpu"
+    else:
+        map_location = None
+        device_note = (
+            f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     with open(args.fixtures, encoding="utf-8") as f:
         fixtures: list[dict[str, Any]] = json.load(f)
@@ -38,7 +51,7 @@ def main() -> int:
     # `from_pretrained` prints a config banner to stdout; keep harness JSON clean.
     _stdout, sys.stdout = sys.stdout, sys.stderr
     try:
-        model = GLiNER2.from_pretrained(args.model_id)
+        model = GLiNER2.from_pretrained(args.model_id, map_location=map_location)
     finally:
         sys.stdout = _stdout
 
@@ -55,14 +68,17 @@ def main() -> int:
             cls.setdefault("true_label", ["N/A"])
 
         t1 = time.perf_counter()
-        result = model.extract(
-            text,
+        # Explicit batch_size=1 to match Rust single-sample multitask path.
+        result = model.batch_extract(
+            [text],
             schema,
+            batch_size=1,
             threshold=threshold,
+            num_workers=0,
             format_results=True,
             include_confidence=False,
             include_spans=False,
-        )
+        )[0]
         infer_ms = (time.perf_counter() - t1) * 1000.0
 
         cases_out.append(

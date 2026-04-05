@@ -60,6 +60,12 @@ def main() -> int:
         default="-",
         help="Output path, or '-' for stdout (default: -)",
     )
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu"),
+        default="auto",
+        help="auto: use CUDA when available; cpu: load and run on CPU (harness CPU-vs-CPU)",
+    )
     args = p.parse_args()
 
     try:
@@ -68,9 +74,16 @@ def main() -> int:
         print("error: torch is required (pulled in by gliner2)", file=sys.stderr)
         return 1
 
-    device_note = (
-        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    )
+    if args.device == "cpu":
+        map_location: str | None = "cpu"
+        device_note = "cpu"
+    else:
+        map_location = None
+        device_note = (
+            f"cuda:{torch.cuda.current_device()}"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
 
     with open(args.fixtures, encoding="utf-8") as f:
         fixtures: list[dict[str, Any]] = json.load(f)
@@ -80,7 +93,7 @@ def main() -> int:
 
     _stdout, sys.stdout = sys.stdout, sys.stderr
     try:
-        model = GLiNER2.from_pretrained(args.model_id)
+        model = GLiNER2.from_pretrained(args.model_id, map_location=map_location)
     finally:
         sys.stdout = _stdout
 
@@ -94,13 +107,15 @@ def main() -> int:
         threshold = float(fix["threshold"])
 
         t1 = time.perf_counter()
-        result = model.extract_entities(
-            text,
-            entity_types,
+        # Explicit batch_size=1 (same as Rust harness single-forward path).
+        result = model.batch_extract_entities(
+            [text],
+            list(entity_types),
+            batch_size=1,
             threshold=threshold,
             include_confidence=True,
             include_spans=True,
-        )
+        )[0]
         infer_ms = (time.perf_counter() - t1) * 1000.0
 
         cases_out.append(

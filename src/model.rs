@@ -170,18 +170,38 @@ impl Extractor {
             .forward(input_ids, None, Some(attention_mask.clone()))
     }
 
-    /// First subword embedding per text word: `[L, D]`.
+    /// First subword embedding per text word: `[L, D]` (uses batch row 0 of `last_hidden`).
     pub fn gather_text_word_embeddings(
         &self,
         last_hidden: &Tensor,
         text_word_first_positions: &[usize],
     ) -> Result<Tensor> {
         let last_hidden = last_hidden.get(0)?;
+        self.gather_text_word_embeddings_row(&last_hidden, text_word_first_positions)
+    }
+
+    /// Same as [`Self::gather_text_word_embeddings`] but for one sequence `[seq, D]`.
+    pub fn gather_text_word_embeddings_row(
+        &self,
+        last_hidden_seq: &Tensor,
+        text_word_first_positions: &[usize],
+    ) -> Result<Tensor> {
         let mut v = Vec::new();
         for &pos in text_word_first_positions {
-            v.push(last_hidden.get(pos)?);
+            v.push(last_hidden_seq.get(pos)?);
         }
         Tensor::stack(&v, 0)
+    }
+
+    /// Gather text-word embeddings for sample `batch_idx` from encoder output `[B, seq, D]`.
+    pub fn gather_text_word_embeddings_batch_idx(
+        &self,
+        last_hidden: &Tensor,
+        batch_idx: usize,
+        text_word_first_positions: &[usize],
+    ) -> Result<Tensor> {
+        let row = last_hidden.get(batch_idx)?;
+        self.gather_text_word_embeddings_row(&row, text_word_first_positions)
     }
 
     /// `[L, max_width, D]` span representations (batch size 1).
@@ -200,6 +220,70 @@ impl Extractor {
             .span_rep
             .forward(&text_word_embs.unsqueeze(0)?, &span_indices)?;
         span_rep.get(0)
+    }
+
+    /// Batched span representations for variable-length `[L_i, D]` text-word embeddings.
+    ///
+    /// Matches Python `compute_span_rep_batched` / `_compute_span_rep_core`: pad to `max L`,
+    /// mask invalid spans with `(0, 0)`, one `SpanMarkerV0` forward, then slice each row to `L_i`.
+    pub fn compute_span_rep_batched(&self, token_embs_list: &[Tensor]) -> Result<Vec<Tensor>> {
+        if token_embs_list.is_empty() {
+            return Ok(vec![]);
+        }
+        let device = token_embs_list[0].device();
+        let mut text_lengths = Vec::with_capacity(token_embs_list.len());
+        let mut hidden = None;
+        for t in token_embs_list {
+            let (l, d) = t.dims2()?;
+            text_lengths.push(l);
+            match hidden {
+                None => hidden = Some(d),
+                Some(h) if h != d => candle_core::bail!("hidden dim mismatch in batch span rep"),
+                _ => {}
+            }
+        }
+        let hidden = hidden.unwrap();
+        let max_text_len = *text_lengths.iter().max().unwrap();
+        let batch_size = token_embs_list.len();
+        let max_width = self.max_width;
+        let n_spans = max_text_len * max_width;
+
+        let mut padded = vec![0f32; batch_size * max_text_len * hidden];
+        for (bi, emb) in token_embs_list.iter().enumerate() {
+            let li = text_lengths[bi];
+            let flat = emb.flatten_all()?.to_vec1::<f32>()?;
+            for j in 0..li {
+                let src = j * hidden;
+                let dst = (bi * max_text_len + j) * hidden;
+                padded[dst..dst + hidden].copy_from_slice(&flat[src..src + hidden]);
+            }
+        }
+        let padded_t = Tensor::from_vec(padded, (batch_size, max_text_len, hidden), device)?;
+
+        let mut safe_flat = vec![0u32; batch_size * n_spans * 2];
+        for (b, &tl) in text_lengths.iter().enumerate().take(batch_size) {
+            for i in 0..max_text_len {
+                for w in 0..max_width {
+                    let idx = i * max_width + w;
+                    let flat_base = (b * n_spans + idx) * 2;
+                    let end = i + w;
+                    let valid = end < tl;
+                    if valid {
+                        safe_flat[flat_base] = i as u32;
+                        safe_flat[flat_base + 1] = end as u32;
+                    }
+                }
+            }
+        }
+        let safe_spans = Tensor::from_vec(safe_flat, (batch_size, n_spans, 2), device)?;
+        let span_rep = self.span_rep.forward(&padded_t, &safe_spans)?;
+
+        let mut out = Vec::with_capacity(batch_size);
+        for (b, &tl) in text_lengths.iter().enumerate().take(batch_size) {
+            let row = span_rep.get(b)?.narrow(0, 0, tl)?;
+            out.push(row);
+        }
+        Ok(out)
     }
 
     /// Logits for each label embedding row `[n, D] -> [n]`.
