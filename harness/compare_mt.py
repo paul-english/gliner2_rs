@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 from typing import Any
 
 
@@ -29,7 +28,9 @@ def deep_compare(
         ak, bk = set(a), set(b)
         if ak != bk:
             ok = False
-            lines.append(f"{path}: keys only rust={sorted(ak - bk)} only py={sorted(bk - ak)}")
+            lines.append(
+                f"{path}: keys only rust={sorted(ak - bk)} only py={sorted(bk - ak)}"
+            )
         for k in sorted(ak & bk):
             sl, sk = deep_compare(a[k], b[k], tol, f"{path}.{k}")
             lines.extend(sl)
@@ -82,7 +83,9 @@ def main() -> int:
             continue
         rc, pc = r_cases[cid], p_cases[cid]
         print(f"\n=== case {cid!r} ===")
-        sl, sk = deep_compare(rc.get("result"), pc.get("result"), args.tolerance, "result")
+        sl, sk = deep_compare(
+            rc.get("result"), pc.get("result"), args.tolerance, "result"
+        )
         for line in sl:
             print(f"  {line}")
         if sk and not sl:

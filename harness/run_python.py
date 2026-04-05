@@ -69,9 +69,7 @@ def main() -> int:
         return 1
 
     device_note = (
-        f"cuda:{torch.cuda.current_device()}"
-        if torch.cuda.is_available()
-        else "cpu"
+        f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     )
 
     with open(args.fixtures, encoding="utf-8") as f:

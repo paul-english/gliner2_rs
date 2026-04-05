@@ -1,13 +1,13 @@
 //! Multi-task extraction and `format_results` aligned with `gliner2.inference.engine`.
 
+use crate::Extractor;
 use crate::preprocess::TaskType;
 use crate::processor::SchemaTransformer;
 use crate::schema::ExtractionMetadata;
-use crate::Extractor;
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Result as CResult, Tensor, D};
+use candle_core::{D, DType, Device, Result as CResult, Tensor};
 use candle_nn::Module;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -73,7 +73,8 @@ pub fn extract_with_schema(
     let attention_mask = Tensor::ones(input_ids.dims(), DType::I64, &device)?;
 
     let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
-    let text_embs = extractor.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
+    let text_embs =
+        extractor.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
     let span_rep = extractor.compute_span_rep(&text_embs)?;
 
     let last_hidden = hidden.get(0)?;
@@ -217,10 +218,7 @@ fn schema_prompt_raw(tokens: &[String]) -> String {
 fn field_names_from_schema_tokens(tokens: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for j in 0..tokens.len().saturating_sub(1) {
-        if matches!(
-            tokens[j].as_str(),
-            "[E]" | "[C]" | "[R]" | "[L]"
-        ) {
+        if matches!(tokens[j].as_str(), "[E]" | "[C]" | "[R]" | "[L]") {
             out.push(tokens[j + 1].clone());
         }
     }
@@ -235,7 +233,9 @@ fn build_cls_fields(schema: &Value) -> HashMap<String, Vec<String>> {
     for st in arr {
         let Some(obj) = st.as_object() else { continue };
         for (parent, fields) in obj {
-            let Some(fmap) = fields.as_object() else { continue };
+            let Some(fmap) = fields.as_object() else {
+                continue;
+            };
             for (fname, fval) in fmap {
                 if fval.get("value").is_some()
                     && let Some(choices) = fval.get("choices").and_then(|c| c.as_array())
@@ -315,10 +315,12 @@ fn extract_classification(
         results.insert(
             schema_name,
             if include_confidence {
-                json!(chosen
-                    .into_iter()
-                    .map(|(l, c)| json!({"label": l, "confidence": c}))
-                    .collect::<Vec<_>>())
+                json!(
+                    chosen
+                        .into_iter()
+                        .map(|(l, c)| json!({"label": l, "confidence": c}))
+                        .collect::<Vec<_>>()
+                )
             } else {
                 json!(chosen.into_iter().map(|(l, _)| l).collect::<Vec<_>>())
             },
@@ -327,10 +329,7 @@ fn extract_classification(
         let p = if class_act == "softmax" {
             softmax(&logits_v)
         } else {
-            logits_v
-                .iter()
-                .map(|&z| 1.0 / (1.0 + (-z).exp()))
-                .collect()
+            logits_v.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect()
         };
         let best = argmax_f32(&p);
         let label = labels.get(best).cloned().unwrap_or_default();
@@ -405,13 +404,8 @@ fn extract_span_task(
     }
 
     let p_emb = embs.get(0)?;
-    let count_logits = extractor
-        .count_pred
-        .forward(&p_emb.unsqueeze(0)?)?;
-    let pred_count = count_logits
-        .argmax(D::Minus1)?
-        .get(0)?
-        .to_scalar::<u32>()? as usize;
+    let count_logits = extractor.count_pred.forward(&p_emb.unsqueeze(0)?)?;
+    let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
 
     if pred_count == 0 {
         insert_empty_span_result(results, schema_name, task_type);
@@ -488,7 +482,11 @@ fn extract_span_task(
     Ok(())
 }
 
-fn insert_empty_span_result(results: &mut Map<String, Value>, schema_name: &str, task_type: &TaskType) {
+fn insert_empty_span_result(
+    results: &mut Map<String, Value>,
+    schema_name: &str,
+    task_type: &TaskType,
+) {
     let v = match task_type {
         TaskType::Entities => json!([]),
         TaskType::Relations => json!([]),
@@ -541,15 +539,31 @@ fn extract_entities_inner(
             .unwrap_or(true);
 
         let scores_2d = slice_scores_pk(span_scores, b, idx, slice_l, l_words, text_len);
-        let spans = find_spans_from_grid(&scores_2d, text_len, ent_threshold, text, start_map, end_map);
+        let spans = find_spans_from_grid(
+            &scores_2d,
+            text_len,
+            ent_threshold,
+            text,
+            start_map,
+            end_map,
+        );
         let formatted = format_spans(&spans, include_confidence, include_spans);
         if dtype_list {
             entity_map.insert(
                 name,
-                json!(formatted
-                    .into_iter()
-                    .map(|(t, c, st, en)| span_to_entity_json(&t, c, st, en, include_confidence, include_spans))
-                    .collect::<Vec<Value>>()),
+                json!(
+                    formatted
+                        .into_iter()
+                        .map(|(t, c, st, en)| span_to_entity_json(
+                            &t,
+                            c,
+                            st,
+                            en,
+                            include_confidence,
+                            include_spans
+                        ))
+                        .collect::<Vec<Value>>()
+                ),
             );
         } else {
             let v = if let Some((t, c, st, en)) = spans.first() {
@@ -705,7 +719,14 @@ fn extract_relations_inner(
             }
             let fidx = field_names.iter().position(|x| x == fname).unwrap();
             let scores_2d = slice_scores_pk(span_scores, inst, fidx, slice_l, l_words, text_len);
-            let spans = find_spans_from_grid(&scores_2d, text_len, rel_threshold, text, start_map, end_map);
+            let spans = find_spans_from_grid(
+                &scores_2d,
+                text_len,
+                rel_threshold,
+                text,
+                start_map,
+                end_map,
+            );
             if let Some((t, c, cs, ce)) = spans.first() {
                 values.push(Some(t.clone()));
                 field_data.push(Some((t.clone(), *c, *cs, *ce)));
@@ -804,7 +825,10 @@ fn extract_structures_inner(
                         if !seen.insert(choice.clone()) {
                             continue;
                         }
-                        let idx = find_choice_idx(choice, &text_tokens[..prefix_len.min(text_tokens.len())]);
+                        let idx = find_choice_idx(
+                            choice,
+                            &text_tokens[..prefix_len.min(text_tokens.len())],
+                        );
                         if idx >= 0 && (idx as usize) < plane.len() {
                             let row = &plane[idx as usize];
                             let score = row.first().copied().unwrap_or(0.);
@@ -822,7 +846,10 @@ fn extract_structures_inner(
                     let mut best: Option<&str> = None;
                     let mut best_score = -1f32;
                     for choice in choices {
-                        let idx = find_choice_idx(choice, &text_tokens[..prefix_len.min(text_tokens.len())]);
+                        let idx = find_choice_idx(
+                            choice,
+                            &text_tokens[..prefix_len.min(text_tokens.len())],
+                        );
                         if idx >= 0 && (idx as usize) < plane.len() {
                             let row = &plane[idx as usize];
                             let score = row.first().copied().unwrap_or(0.);
@@ -848,13 +875,23 @@ fn extract_structures_inner(
                     instance.insert(fname.clone(), v);
                 }
             } else {
-                let scores_2d = slice_scores_pk(span_scores, inst, fidx, slice_l, l_words, text_len);
-                let spans = find_spans_from_grid(&scores_2d, text_len, field_threshold, text, start_map, end_map);
+                let scores_2d =
+                    slice_scores_pk(span_scores, inst, fidx, slice_l, l_words, text_len);
+                let spans = find_spans_from_grid(
+                    &scores_2d,
+                    text_len,
+                    field_threshold,
+                    text,
+                    start_map,
+                    end_map,
+                );
                 let formatted = format_spans(&spans, include_confidence, include_spans);
                 if dtype_list {
                     let arr: Vec<Value> = formatted
                         .into_iter()
-                        .map(|(t, c, st, en)| span_to_entity_json(&t, c, st, en, include_confidence, include_spans))
+                        .map(|(t, c, st, en)| {
+                            span_to_entity_json(&t, c, st, en, include_confidence, include_spans)
+                        })
                         .collect();
                     instance.insert(fname.clone(), Value::Array(arr));
                 } else {
@@ -898,7 +935,9 @@ fn format_results(
                 match &value {
                     Value::Array(a) if !a.is_empty() => match a.first() {
                         Some(Value::Array(inner)) if inner.len() == 2 => true,
-                        Some(Value::Object(o)) if o.contains_key("head") && o.contains_key("tail") => {
+                        Some(Value::Object(o))
+                            if o.contains_key("head") && o.contains_key("tail") =>
+                        {
                             true
                         }
                         _ => false,
@@ -956,7 +995,10 @@ fn format_results(
                 } else {
                     let mapped: Vec<Value> = a
                         .iter()
-                        .filter_map(|v| v.as_object().map(|o| format_struct_obj(o, include_confidence)))
+                        .filter_map(|v| {
+                            v.as_object()
+                                .map(|o| format_struct_obj(o, include_confidence))
+                        })
                         .collect();
                     formatted.insert(key, Value::Array(mapped));
                 }
@@ -990,7 +1032,10 @@ fn format_entity_dict(ent: &Map<String, Value>, include_confidence: bool) -> Val
                 let mut seen = HashSet::new();
                 for it in items {
                     let text_key = match it {
-                        Value::String(s) => Some((s.to_lowercase(), format_string_list_item(s, include_confidence))),
+                        Value::String(s) => Some((
+                            s.to_lowercase(),
+                            format_string_list_item(s, include_confidence),
+                        )),
                         Value::Object(o) => o.get("text").and_then(|t| t.as_str()).map(|t| {
                             let lk = t.to_lowercase();
                             (lk.clone(), it.clone())
@@ -1112,9 +1157,9 @@ impl Extractor {
         structures: &Value,
         opts: &ExtractOptions,
     ) -> Result<Value> {
-        let obj = structures
-            .as_object()
-            .context("extract_json: structures must be a JSON object (parent → field spec array)")?;
+        let obj = structures.as_object().context(
+            "extract_json: structures must be a JSON object (parent → field spec array)",
+        )?;
         let mut s = crate::schema::Schema::new();
         s.extract_json_structures(obj)?;
         let (schema_val, meta) = s.build();

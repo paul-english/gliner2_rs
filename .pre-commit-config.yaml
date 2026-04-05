@@ -1,5 +1,5 @@
 # See https://pre-commit.com for usage.
-exclude: ^reference/
+exclude: ^(\.tickets/|reference/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

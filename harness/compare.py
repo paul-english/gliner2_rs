@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from typing import Any
 
 
@@ -135,7 +134,9 @@ def main() -> int:
     p_total = sum(float(c.get("infer_ms", 0)) for c in py.get("cases", []))
     print()
     print("--- total infer_ms (sum of cases) ---")
-    print(f"rust: {r_total:.3f}  python: {p_total:.3f}  ratio: {(p_total/r_total if r_total else float('inf')):.3f}x")
+    print(
+        f"rust: {r_total:.3f}  python: {p_total:.3f}  ratio: {(p_total / r_total if r_total else float('inf')):.3f}x"
+    )
 
     if args.warn_only:
         return 0
