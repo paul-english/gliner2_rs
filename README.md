@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/gliner2/badge.svg)](https://docs.rs/gliner2)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/gliner2/blob/main/LICENSE)
 
-This project implements the Gliner2 model in rust with compatibility to the original weights and output of the python training.
+This project implements the [Gliner2](https://github.com/fastino-ai/GLiNER2) model in rust with compatibility to the original weights and output of the python training.
 
 ```bash
 cargo add gliner2
