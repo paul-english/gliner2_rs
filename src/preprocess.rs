@@ -49,11 +49,7 @@ pub fn collate_preprocessed(samples: &[PreprocessedInput]) -> Option<Preprocesse
         return None;
     }
     let batch_size = samples.len();
-    let max_seq_len = samples
-        .iter()
-        .map(|s| s.input_ids.len())
-        .max()
-        .unwrap_or(0);
+    let max_seq_len = samples.iter().map(|s| s.input_ids.len()).max().unwrap_or(0);
     let mut input_ids = vec![0u32; batch_size * max_seq_len];
     let mut attention_mask = vec![0u32; batch_size * max_seq_len];
     for (i, s) in samples.iter().enumerate() {
@@ -630,10 +626,13 @@ mod tests {
         assert_eq!(batch.batch_size, 2);
         assert_eq!(batch.max_seq_len, 5);
         assert_eq!(batch.input_ids.len(), 10);
-        assert_eq!(batch.attention_mask, vec![
-            1, 1, 1, 0, 0, //
-            1, 1, 1, 1, 1,
-        ]);
+        assert_eq!(
+            batch.attention_mask,
+            vec![
+                1, 1, 1, 0, 0, //
+                1, 1, 1, 1, 1,
+            ]
+        );
         assert_eq!(&batch.input_ids[0..3], &[10, 11, 12]);
         assert_eq!(&batch.input_ids[5..10], &[100, 101, 102, 103, 104]);
     }

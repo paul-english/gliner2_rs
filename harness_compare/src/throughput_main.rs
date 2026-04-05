@@ -47,18 +47,11 @@ fn parse_args() -> Result<(String, String, usize, usize, usize)> {
         match args[i].as_str() {
             "--fixtures" => {
                 i += 1;
-                fixtures_path = Some(
-                    args.get(i)
-                        .context("--fixtures needs a path")?
-                        .clone(),
-                );
+                fixtures_path = Some(args.get(i).context("--fixtures needs a path")?.clone());
             }
             "--model-id" => {
                 i += 1;
-                model_id = args
-                    .get(i)
-                    .context("--model-id needs a value")?
-                    .clone();
+                model_id = args.get(i).context("--model-id needs a value")?.clone();
             }
             "--samples" => {
                 i += 1;
@@ -88,7 +81,9 @@ fn parse_args() -> Result<(String, String, usize, usize, usize)> {
                 fixtures_path = Some(other.to_string());
             }
             other => {
-                anyhow::bail!("unknown arg {other:?}; try: harness_throughput <fixtures.json> [--samples N] [--warmup W] [--model-id ID] [--rust-batch-size B]")
+                anyhow::bail!(
+                    "unknown arg {other:?}; try: harness_throughput <fixtures.json> [--samples N] [--warmup W] [--model-id ID] [--rust-batch-size B]"
+                )
             }
         }
         i += 1;
@@ -106,8 +101,7 @@ fn main() -> Result<()> {
 
     let fixtures_json =
         fs::read_to_string(&fixtures_path).with_context(|| format!("read {}", fixtures_path))?;
-    let base: Vec<Fixture> =
-        serde_json::from_str(&fixtures_json).context("parse fixtures JSON")?;
+    let base: Vec<Fixture> = serde_json::from_str(&fixtures_json).context("parse fixtures JSON")?;
     anyhow::ensure!(!base.is_empty(), "fixtures must be non-empty");
 
     let labels: Vec<&str> = THROUGHPUT_LABELS.to_vec();
@@ -203,12 +197,8 @@ fn main() -> Result<()> {
     }
 
     let infer_start = Instant::now();
-    let _ = extractor.batch_extract_entities(
-        &processor,
-        &text_vec,
-        &labels_owned,
-        &extract_opts,
-    )?;
+    let _ =
+        extractor.batch_extract_entities(&processor, &text_vec, &labels_owned, &extract_opts)?;
     let total_infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
     let samples_per_sec = if total_infer_ms > 0.0 {
         samples as f64 / (total_infer_ms / 1000.0)
@@ -232,4 +222,3 @@ fn main() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
-

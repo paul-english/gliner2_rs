@@ -5,8 +5,8 @@ use candle_transformers::models::debertav2::Config as DebertaConfig;
 use gliner2::config::download_model;
 use gliner2::schema::infer_metadata_from_schema;
 use gliner2::{
-    ExtractOptions, Extractor, ExtractorConfig, SchemaTransformer, batch_extract, extract_with_schema,
-    BatchSchemaMode,
+    BatchSchemaMode, ExtractOptions, Extractor, ExtractorConfig, SchemaTransformer, batch_extract,
+    extract_with_schema,
 };
 use serde_json::{Value, json};
 
@@ -27,7 +27,8 @@ fn batch_extract_matches_sequential_shared_schema() {
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap()).unwrap();
     encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
     let extractor = Extractor::load(config, encoder_config, vb).unwrap();
 
     let schema = json!({
@@ -86,7 +87,8 @@ fn batch_extract_matches_sequential_per_sample_schema() {
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap()).unwrap();
     encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
     let extractor = Extractor::load(config, encoder_config, vb).unwrap();
 
     let s0 = json!({ "entities": { "person": "", "company": "" } });
@@ -96,18 +98,31 @@ fn batch_extract_matches_sequential_per_sample_schema() {
     let schemas: Vec<Value> = vec![s0.clone(), s1.clone()];
     let metas = vec![meta0, meta1];
 
-    let texts: Vec<String> = vec![
-        "Alice works at Acme.".into(),
-        "They met in Berlin.".into(),
-    ];
+    let texts: Vec<String> = vec!["Alice works at Acme.".into(), "They met in Berlin.".into()];
 
     let opts = ExtractOptions {
         batch_size: 2,
         ..Default::default()
     };
 
-    let seq0 = extract_with_schema(&extractor, &processor, &texts[0], &schemas[0], &metas[0], &opts).unwrap();
-    let seq1 = extract_with_schema(&extractor, &processor, &texts[1], &schemas[1], &metas[1], &opts).unwrap();
+    let seq0 = extract_with_schema(
+        &extractor,
+        &processor,
+        &texts[0],
+        &schemas[0],
+        &metas[0],
+        &opts,
+    )
+    .unwrap();
+    let seq1 = extract_with_schema(
+        &extractor,
+        &processor,
+        &texts[1],
+        &schemas[1],
+        &metas[1],
+        &opts,
+    )
+    .unwrap();
 
     let batched = batch_extract(
         &extractor,

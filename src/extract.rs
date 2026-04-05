@@ -95,9 +95,7 @@ pub fn extract_from_preprocessed(
     opts: &ExtractOptions,
 ) -> Result<Value> {
     let span_for_tasks: Option<&Tensor> = if sample_needs_span_rep(pre) {
-        Some(
-            span_rep.context("extract_from_preprocessed: span_rep required for span tasks")?,
-        )
+        Some(span_rep.context("extract_from_preprocessed: span_rep required for span tasks")?)
     } else {
         None
     };
@@ -249,14 +247,7 @@ pub fn extract_with_schema(
 
     let last_hidden = hidden.get(0)?;
     let span_opt = sample_needs_span_rep(&pre).then_some(&span_rep);
-    extract_from_preprocessed(
-        extractor,
-        &pre,
-        &last_hidden,
-        span_opt,
-        meta,
-        opts,
-    )
+    extract_from_preprocessed(extractor, &pre, &last_hidden, span_opt, meta, opts)
 }
 
 /// Batch extract with Python `batch_extract` semantics: padded encoder passes, batched span rep, per-sample decode.
@@ -301,9 +292,7 @@ pub fn batch_extract(
             let global = base + j;
             let (schema, meta) = match mode {
                 BatchSchemaMode::Shared { schema, meta } => (schema, meta),
-                BatchSchemaMode::PerSample { schemas, metas } => {
-                    (&schemas[global], &metas[global])
-                }
+                BatchSchemaMode::PerSample { schemas, metas } => (&schemas[global], &metas[global]),
             };
             let pre = transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
             pres.push(pre);
@@ -316,16 +305,9 @@ pub fn batch_extract(
             (batch.batch_size, batch.max_seq_len),
             &device,
         )?;
-        let mask_i64: Vec<i64> = batch
-            .attention_mask
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
-        let attention_mask = Tensor::from_vec(
-            mask_i64,
-            (batch.batch_size, batch.max_seq_len),
-            &device,
-        )?;
+        let mask_i64: Vec<i64> = batch.attention_mask.iter().map(|&x| x as i64).collect();
+        let attention_mask =
+            Tensor::from_vec(mask_i64, (batch.batch_size, batch.max_seq_len), &device)?;
 
         let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
 
