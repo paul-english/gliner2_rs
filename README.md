@@ -236,34 +236,206 @@ let out = extractor.extract(&transformer, text, &schema_val, &meta, &opts)?;
 
 ### Batch Inference (Not implemented yet)
 
-We plan to support batch inference similar to the python implementation soon.
+We plan to support tensor batch inference in the library, similar to the Python implementation. The **[CLI specification](#cli-specification)** below already defines default batching and `--batch-size` for multi-record runs; the Rust API and CLI will converge on that behavior.
 
-## CLI Usage (Not implemented yet)
+## CLI specification
 
-The CLI allows running batch inference tasks against individual files (json,jsonl,txt).
+The command-line interface is **not implemented yet**. This section specifies the intended `gliner2` binary (see `default-run` in `Cargo.toml`) so future work can match the library API and Python `GLiNER2` behavior.
 
-```bash
-# entity extraction
-gliner2 extract --label PER --label ORG <input>
-gliner2 extract --label "PER:A person" --label "ORG:An organization" --confidence <input>
+Install the binary with `cargo install gliner2`. Inference flags mirror [`ExtractOptions`](src/extract.rs) (`threshold`, `format_results`, `include_confidence`, `include_spans`, `max_len`).
 
-# classify
-gliner2 classify --multi --label ...
+### Command overview
 
-# schema extraction
-gliner2 schema --schema "{...}"
-
-# relation extraction
-gliner2 relation --relation works_for
+```mermaid
+flowchart LR
+  subgraph sub [Subcommands]
+    entities[entities]
+    classify[classify]
+    relations[relations]
+    jsonCmd[json]
+    run[run]
+  end
+  gliner2[gliner2] --> entities
+  gliner2 --> classify
+  gliner2 --> relations
+  gliner2 --> jsonCmd
+  gliner2 --> run
 ```
 
-Inputs:
-- `jsonl`: gliner2_rs will default to looking for a `text` field, though this can be overridden with the `--field` argument
-- `json`: Similar to `jsonl` for a single record. (Use `jq` or similar if you need batching on a nested array in your json file).
-- `txt`: Plain text input requires a segmentation method: `--segment-text=full|sentence|chars` (TODO needs some thought)
+| Subcommand | Purpose | Library analogue |
+|------------|---------|------------------|
+| `gliner2 entities` | Named-entity extraction | `Extractor::extract_entities`, `Schema::entities` |
+| `gliner2 classify` | Text classification (single- or multi-label) | `Extractor::classify_text`, `Schema::classification` |
+| `gliner2 relations` | Relation extraction | `Extractor::extract_relations`, `Schema::relations` |
+| `gliner2 json` | Structured JSON / field extraction | `Extractor::extract_json`, `Schema::extract_json_structures` |
+| `gliner2 run` | Multitask: full engine schema in one pass | `Extractor::extract` |
 
-Output:
-gliner2_rs will return `jsonl` output that matches the python output for any of these tasks.
+Top-level: `gliner2 --help`, `gliner2 --version`, and `gliner2 <subcommand> --help`.
+
+### Global options
+
+These apply to every subcommand unless stated otherwise.
+
+| Flag | Description |
+|------|-------------|
+| `--model <HF_REPO_ID>` | Hugging Face model id (default: `fastino/gliner2-base-v1`, same as `harness/` scripts). |
+| `--model-dir <DIR>` | Offline layout: `config.json`, `encoder_config/config.json`, `tokenizer.json`, `model.safetensors` (matches `ModelFiles` from [`download_model`](src/config.rs)). |
+| `--config`, `--encoder-config`, `--tokenizer`, `--weights` | Explicit paths instead of `--model` / `--model-dir`. |
+| `-q`, `-v` / `--log-level` | Quiet / verbose logging (exact mapping is implementation-defined). |
+
+Use either Hub resolution (`--model`) **or** a local layout (`--model-dir` or explicit file flags), not a conflicting mix; if both are given, the implementation should reject the invocation with a clear error.
+
+**Device and dtype** are intentionally unspecified here until the library exposes them; do not document GPU flags until they exist.
+
+### Shared inference flags
+
+| Flag | Maps to | Default |
+|------|---------|---------|
+| `--threshold <float>` | `ExtractOptions::threshold` | `0.5` |
+| `--max-len <N>` | `ExtractOptions::max_len` | unset |
+| `--include-confidence` | `include_confidence` | off |
+| `--include-spans` | `include_spans` | off |
+| `--raw` / `--no-format-results` | `format_results = false` | formatted output (`true`) |
+
+### Batching
+
+Tensor batch inference is **not** implemented in the crate yet, but the CLI contract assumes **batched execution** for any input that produces **more than one logical record** (for example multi-line JSONL or plain text with `--text-split line` and multiple non-empty lines). Early CLI or library builds may still run one record per forward pass internally; the user-facing behavior and flags below remain the target.
+
+| Flag | Description |
+|------|-------------|
+| `--batch-size <N>` | Maximum records per model batch. Default: **8** (implementation may choose a lower value on constrained devices, but must document any deviation). |
+| `--batch-size 1` | Effectively sequential inference (debugging, peak memory limits, or until batched paths are stable). |
+
+**Single-record** inputs (one JSONL line, one JSON object, or `--text-split full` over an entire file) form a single batch of size 1.
+
+**Ordering:** Output lines must follow **the same order as input records**, even when flushing internal batches.
+
+### Input and output
+
+**Input:** final positional argument `INPUT`, or `-` for stdin.
+
+| Flag | Description |
+|------|-------------|
+| `--text-field <KEY>` | Field containing document text in JSON / JSONL records (default: `text`). |
+| `--id-field <KEY>` | Field to pass through as record id when present (default: `id`). |
+| `--text-split <MODE>` | Plain text: `full` (whole file) or `line` (one record per non-empty line). `sentence` / `char-chunk` reserved. Default: `full`. |
+
+| Format | Detection / notes |
+|--------|-------------------|
+| **JSONL** | One JSON object per line. Text from `--text-field` (default: `text`). If the input object contains the id key named by `--id-field` (default: `id`), copy that field through to the output object. |
+| **JSON** | A single object using the same field convention. For many records, use JSONL or preprocess (for example with `jq`). |
+| **Plain text** | Controlled by `--text-split`: `full` (default for `.txt`) — entire file is one record; `line` — each non-empty line is one record (multiple lines ⇒ batching). **`sentence` and `char-chunk`** are reserved for a future release (segmentation semantics TBD). |
+
+**Output:** JSONL to stdout by default. `--output <PATH>` / `-o <PATH>` (use `-` for stdout). Optional `--pretty`: pretty-printed JSON when the implementation can buffer a single record or full result (for example one JSON object input or explicit single-line mode).
+
+**Format inference:** From `INPUT`’s path suffix when possible: `.jsonl` → JSONL, `.json` → single JSON object, `.txt` (or other) → plain text with `--text-split`. For stdin (`-`), default input format is **JSONL** (one object per line).
+
+### Output record shape
+
+Each output line is one JSON object, for example:
+
+```json
+{"id":"optional","text":"...","result":{ }}
+```
+
+`result` matches Python / Rust **`format_results`** output for the task mix (entities, `relation_extraction`, classification keys, structured parents, etc.), consistent with the harness direction in `harness/compare.py` and multitask fixtures. If the input record has no `id`, omit `id` from the output (or use `null`; implementations should pick one behavior and document it).
+
+### Subcommands
+
+#### `gliner2 entities`
+
+| Flag | Description |
+|------|-------------|
+| `--label <NAME>` | Repeatable entity type name. |
+| `--labels-json <PATH>` | JSON array of names or object form accepted by `Schema::entities` (name → description string or `{ "description", "dtype", "threshold" }`). |
+
+**Precedence:** If any `--label` is given **and** `--labels-json` is given, exit with a usage error (do not merge).
+
+#### `gliner2 classify`
+
+| Flag | Description |
+|------|-------------|
+| `--task <NAME>` | Required classification task name (JSON key in formatted output). |
+| `--label <NAME>` | Repeatable class label. |
+| `--labels-json <PATH>` | Array of labels or object label → description (Python-style). |
+| `--multi-label` | Multi-label classification (`Schema::classification` with `multi_label: true`). |
+| `--cls-threshold <float>` | Per-task classifier threshold (default `0.5`). |
+
+Same rule: do not combine `--label` with `--labels-json`.
+
+#### `gliner2 relations`
+
+| Flag | Description |
+|------|-------------|
+| `--relation <NAME>` | Repeatable relation type name. |
+| `--relations-json <PATH>` | JSON array of names or object form accepted by `Schema::relations`. |
+
+Do not pass both repeatable `--relation` and `--relations-json`.
+
+#### `gliner2 json`
+
+| Flag | Description |
+|------|-------------|
+| `--structures <PATH>` | JSON file: object mapping structure name → array of field specs. |
+| `--structures-json '<OBJECT>'` | Same object inline. |
+
+Field specs use the same grammar as **Structured JSON (`extract_json`)** above: strings like `name::dtype::[choices]::description` or JSON objects parsed by [`parse_field_spec`](src/schema.rs). Do not pass both `--structures` and `--structures-json`.
+
+#### `gliner2 run`
+
+| Flag | Description |
+|------|-------------|
+| `--schema-file <PATH>` | Required. Full **engine** multitask schema (same shape as Python `GLiNER2.extract(text, schema)`). See [`harness/fixtures_multitask.json`](harness/fixtures_multitask.json) for a minimal example: `entities`, `classifications`, `relations`, `json_structures`, optional `entity_descriptions` / `json_descriptions`. |
+
+Each entry in `classifications` should include `"true_label": ["N/A"]` when mirroring Python; the harness script [`harness/run_multitask_python.py`](harness/run_multitask_python.py) sets this if missing.
+
+### Environment
+
+- **`HF_TOKEN`** — access to private or gated Hub models.
+- Cache and offline behavior follow [Hugging Face Hub](https://huggingface.co/docs/huggingface_hub/index) environment variables (`HF_HOME`, etc.); see upstream docs for the full list.
+
+### Exit codes
+
+- **0** — success.
+- **Non-zero** — usage errors, I/O failures, model load failures, or inference errors.
+
+### Examples
+
+```bash
+# Entities: JSONL in → JSONL out (multi-record; default --batch-size 8 unless overridden)
+gliner2 entities --label company --label person --batch-size 16 docs.jsonl --output out.jsonl
+
+# Classify with labels from a file (JSONL input)
+gliner2 classify --task sentiment --labels-json labels.json tweets.jsonl
+
+# Relations
+gliner2 relations --relation works_for --relation located_in article.txt
+
+# Structured JSON (structures file matches extract_json object shape)
+gliner2 json --structures product_fields.json --text-split full product_blurb.txt
+
+# Multitask: JSONL file, custom text field
+gliner2 run --schema-file schema.json --text-field body --batch-size 4 docs.jsonl
+```
+
+Minimal multitask schema file (trimmed from fixtures):
+
+```schema.json
+{
+  "json_structures": [],
+  "entities": { "company": "", "product": "" },
+  "relations": [],
+  "classifications": [
+    {
+      "task": "sentiment",
+      "labels": ["positive", "negative", "neutral"],
+      "multi_label": false,
+      "cls_threshold": 0.5,
+      "true_label": ["N/A"]
+    }
+  ]
+}
+```
 
 ## Python Interface (Not implemented yet)
 
