@@ -8,6 +8,34 @@ cargo add gliner2
 cargo install gliner2
 ```
 
+## Development
+
+### Pre-commit
+
+Git hooks run the same Rust checks as CI (`cargo fmt`, `cargo clippy` on the workspace) plus [Ruff](https://docs.astral.sh/ruff/) on first-party Python (for example under `harness/`). Vendored code under `reference/` is excluded.
+
+**Prerequisites:** stable Rust with `rustfmt` and `clippy` (for example `rustup component add rustfmt clippy`).
+
+**Install** [pre-commit](https://pre-commit.com/) (either is fine):
+
+```bash
+uv tool install pre-commit
+```
+
+From the repository root, install the hooks once:
+
+```bash
+pre-commit install
+```
+
+Optionally validate the whole tree:
+
+```bash
+pre-commit run --all-files
+```
+
+If you must commit before fixing Clippy, you can skip that hook: `SKIP=cargo-clippy git commit` (use sparingly; CI still enforces warnings as errors).
+
 ## Usage
 
 Like the Python implementation, this crate supports a full extraction API. You load the model once, build a `SchemaTransformer` from the tokenizer, then call `Extractor` methods.

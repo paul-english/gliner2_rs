@@ -29,8 +29,7 @@ pub fn find_spans(
         let label = labels[p];
         let mut per_label = Vec::new();
         for i in 0..l {
-            for j in 0..max_width {
-                let conf = scores_v[p][i][j];
+            for (j, &conf) in scores_v[p][i].iter().enumerate().take(max_width) {
                 if conf >= threshold {
                     let end_token_idx = i + j;
                     if end_token_idx < l {
@@ -80,7 +79,7 @@ pub fn greedy_select(mut entities: Vec<Entity>) -> Vec<Entity> {
 
 #[cfg(test)]
 mod tests {
-    use super::{greedy_select, Entity};
+    use super::{Entity, greedy_select};
 
     #[test]
     fn per_label_greedy_keeps_overlapping_spans_for_different_labels() {

@@ -19,6 +19,8 @@ pub struct ExtractOptions {
     pub max_len: Option<usize>,
 }
 
+// Nested indices mirror row-major layout from flat[idx]; iterator/clippy refactors obscure that mapping.
+#[allow(clippy::needless_range_loop)]
 fn tensor_to_vec4(t: &Tensor) -> CResult<Vec<Vec<Vec<Vec<f32>>>>> {
     let dims = t.dims();
     if dims.len() != 4 {
@@ -109,7 +111,7 @@ pub fn extract_with_schema(
                     &mut raw,
                     &schema_tokens,
                     &pre.schema_original,
-                    &extractor,
+                    extractor,
                     &embs,
                     opts.include_confidence,
                 )?;
@@ -235,14 +237,14 @@ fn build_cls_fields(schema: &Value) -> HashMap<String, Vec<String>> {
         for (parent, fields) in obj {
             let Some(fmap) = fields.as_object() else { continue };
             for (fname, fval) in fmap {
-                if fval.get("value").is_some() {
-                    if let Some(choices) = fval.get("choices").and_then(|c| c.as_array()) {
-                        let ch: Vec<String> = choices
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
-                        m.insert(format!("{parent}.{fname}"), ch);
-                    }
+                if fval.get("value").is_some()
+                    && let Some(choices) = fval.get("choices").and_then(|c| c.as_array())
+                {
+                    let ch: Vec<String> = choices
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    m.insert(format!("{parent}.{fname}"), ch);
                 }
             }
         }
@@ -496,6 +498,7 @@ fn insert_empty_span_result(results: &mut Map<String, Value>, schema_name: &str,
     results.insert(schema_name.to_string(), v);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_entities_inner(
     field_names: &[String],
     span_scores: &[Vec<Vec<Vec<f32>>>],
@@ -513,11 +516,7 @@ fn extract_entities_inner(
     include_spans: bool,
 ) -> CResult<Value> {
     let b = 0usize;
-    let slice_l = if l_words >= text_len {
-        l_words - text_len
-    } else {
-        0
-    };
+    let slice_l = l_words.saturating_sub(text_len);
     let mut entity_map = Map::new();
     let order: Vec<String> = if meta.entity_order.is_empty() {
         field_names.to_vec()
@@ -599,7 +598,7 @@ fn slice_scores_pk(
     let Some(row) = plane.get(p) else {
         return empty;
     };
-    let max_w = row.get(0).map(|r| r.len()).unwrap_or(0);
+    let max_w = row.first().map(|r| r.len()).unwrap_or(0);
     let mut out = vec![vec![0f32; max_w]; text_len];
     for (ti, l) in (slice_l..l_words).enumerate() {
         if ti >= text_len {
@@ -624,11 +623,10 @@ fn find_spans_from_grid(
     start_map: &[usize],
     end_map: &[usize],
 ) -> Vec<(String, f32, usize, usize)> {
-    let max_w = scores.get(0).map(|r| r.len()).unwrap_or(0);
+    let max_w = scores.first().map(|r| r.len()).unwrap_or(0);
     let mut spans = Vec::new();
-    for start in 0..text_len {
-        for width in 0..max_w {
-            let conf = scores[start][width];
+    for (start, row) in scores.iter().enumerate().take(text_len) {
+        for (width, &conf) in row.iter().enumerate().take(max_w) {
             if conf < threshold {
                 continue;
             }
@@ -667,6 +665,7 @@ fn format_spans(
     selected
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_relations_inner(
     rel_name: &str,
     field_names: &[String],
@@ -754,6 +753,7 @@ fn find_choice_idx(choice: &str, tokens: &[String]) -> isize {
     -1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_structures_inner(
     struct_name: &str,
     field_names: &[String],
@@ -807,7 +807,7 @@ fn extract_structures_inner(
                         let idx = find_choice_idx(choice, &text_tokens[..prefix_len.min(text_tokens.len())]);
                         if idx >= 0 && (idx as usize) < plane.len() {
                             let row = &plane[idx as usize];
-                            let score = row.get(0).copied().unwrap_or(0.);
+                            let score = row.first().copied().unwrap_or(0.);
                             if score >= field_threshold {
                                 if include_confidence {
                                     selected.push(json!({"text": choice, "confidence": score}));
@@ -825,7 +825,7 @@ fn extract_structures_inner(
                         let idx = find_choice_idx(choice, &text_tokens[..prefix_len.min(text_tokens.len())]);
                         if idx >= 0 && (idx as usize) < plane.len() {
                             let row = &plane[idx as usize];
-                            let score = row.get(0).copied().unwrap_or(0.);
+                            let score = row.first().copied().unwrap_or(0.);
                             if score > best_score {
                                 best_score = score;
                                 best = Some(choice.as_str());
@@ -997,10 +997,10 @@ fn format_entity_dict(ent: &Map<String, Value>, include_confidence: bool) -> Val
                         }),
                         _ => None,
                     };
-                    if let Some((lk, val)) = text_key {
-                        if seen.insert(lk) {
-                            unique.push(val);
-                        }
+                    if let Some((lk, val)) = text_key
+                        && seen.insert(lk)
+                    {
+                        unique.push(val);
                     }
                 }
                 Value::Array(unique)

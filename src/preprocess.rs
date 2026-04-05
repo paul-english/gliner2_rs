@@ -170,12 +170,12 @@ impl SchemaTransformer {
                     text_word_first_positions.push(input_ids.len());
                     last_text_orig = Some(orig_idx);
                 }
-            } else if seg_type == "schema" && schema_idx < num_schemas {
-                if let Some(&first_id) = ids.first() {
-                    if self.special_token_ids.contains(&first_id) {
-                        schema_special_positions[schema_idx].push(input_ids.len());
-                    }
-                }
+            } else if seg_type == "schema"
+                && schema_idx < num_schemas
+                && let Some(&first_id) = ids.first()
+                && self.special_token_ids.contains(&first_id)
+            {
+                schema_special_positions[schema_idx].push(input_ids.len());
             }
 
             input_ids.extend(ids.iter().copied());
@@ -209,7 +209,9 @@ fn build_classification_prefix(schema: &Value) -> Vec<String> {
     for st in arr {
         let Some(obj) = st.as_object() else { continue };
         for (parent, fields) in obj {
-            let Some(fmap) = fields.as_object() else { continue };
+            let Some(fmap) = fields.as_object() else {
+                continue;
+            };
             let mut cls_fields: Vec<(String, Vec<String>)> = Vec::new();
             for (fname, fval) in fmap {
                 if let Some(choices) = fval
@@ -252,13 +254,20 @@ fn build_classification_prefix(schema: &Value) -> Vec<String> {
 }
 
 fn wrap_classification_fields(schema: &mut Value) {
-    let Some(arr) = schema.get_mut("json_structures").and_then(|v| v.as_array_mut()) else {
+    let Some(arr) = schema
+        .get_mut("json_structures")
+        .and_then(|v| v.as_array_mut())
+    else {
         return;
     };
     for st in arr.iter_mut() {
-        let Some(obj) = st.as_object_mut() else { continue };
+        let Some(obj) = st.as_object_mut() else {
+            continue;
+        };
         for (_parent, fields) in obj.iter_mut() {
-            let Some(fmap) = fields.as_object_mut() else { continue };
+            let Some(fmap) = fields.as_object_mut() else {
+                continue;
+            };
             for (_fname, fval) in fmap.iter_mut() {
                 if fval.get("choices").is_none() || fval.get("value").is_none() {
                     continue;
@@ -309,22 +318,22 @@ fn transform_schema(
     example_mode: &str,
 ) -> Vec<String> {
     let mut prompt_str = parent.to_string();
-    if example_mode == "descriptions" || example_mode == "both" {
-        if let Some(descs) = label_descriptions {
-            let mut pairs: Vec<_> = descs
-                .iter()
-                .filter(|(l, _)| fields.iter().any(|f| f == *l))
-                .collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            for (label, desc) in pairs {
-                let d = desc.as_str().unwrap_or("");
-                prompt_str.push(' ');
-                prompt_str.push_str(DESC_TOKEN);
-                prompt_str.push(' ');
-                prompt_str.push_str(label);
-                prompt_str.push_str(": ");
-                prompt_str.push_str(d);
-            }
+    if (example_mode == "descriptions" || example_mode == "both")
+        && let Some(descs) = label_descriptions
+    {
+        let mut pairs: Vec<_> = descs
+            .iter()
+            .filter(|(l, _)| fields.iter().any(|f| f == *l))
+            .collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for (label, desc) in pairs {
+            let d = desc.as_str().unwrap_or("");
+            prompt_str.push(' ');
+            prompt_str.push_str(DESC_TOKEN);
+            prompt_str.push(' ');
+            prompt_str.push_str(label);
+            prompt_str.push_str(": ");
+            prompt_str.push_str(d);
         }
     }
     if example_mode == "few_shot" || example_mode == "both" {
@@ -358,14 +367,20 @@ fn transform_schema(
     tokens
 }
 
-fn process_json_structures(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut Vec<TaskType>) {
+fn process_json_structures(
+    schema: &Value,
+    schemas: &mut Vec<Vec<String>>,
+    types: &mut Vec<TaskType>,
+) {
     let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) else {
         return;
     };
 
     let mut groups: Vec<(String, Vec<serde_json::Map<String, Value>>)> = Vec::new();
     for item in arr {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         for (parent, fields) in obj {
             if let Some(fmap) = fields.as_object() {
                 if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
@@ -408,7 +423,11 @@ fn process_json_structures(schema: &Value, schemas: &mut Vec<Vec<String>>, types
             "[C]",
             desc_ref,
             &[],
-            if mode == "none" { "none" } else { "descriptions" },
+            if mode == "none" {
+                "none"
+            } else {
+                "descriptions"
+            },
         );
         schemas.push(toks);
         types.push(TaskType::JsonStructures);
@@ -437,7 +456,11 @@ fn process_entities(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut 
         crate::processor::E_TOKEN,
         descs,
         &[],
-        if mode == "none" { "none" } else { "descriptions" },
+        if mode == "none" {
+            "none"
+        } else {
+            "descriptions"
+        },
     );
     schemas.push(toks);
     types.push(TaskType::Entities);
@@ -449,7 +472,9 @@ fn process_relations(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut
     };
     let mut groups: Vec<(String, Vec<serde_json::Map<String, Value>>)> = Vec::new();
     for item in arr {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         for (parent, fields) in obj {
             if let Some(fmap) = fields.as_object() {
                 if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
@@ -477,7 +502,9 @@ fn process_classifications(
         return Ok(());
     };
     for item in arr {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let task = obj
             .get("task")
             .and_then(|v| v.as_str())
@@ -499,12 +526,12 @@ fn process_classifications(
             .map(|a| {
                 a.iter()
                     .filter_map(|ex| {
-                        if let Some(tup) = ex.as_array() {
-                            if tup.len() >= 2 {
-                                let inp = tup[0].as_str()?.to_string();
-                                let out = tup[1].as_str()?.to_string();
-                                return Some((inp, out));
-                            }
+                        if let Some(tup) = ex.as_array()
+                            && tup.len() >= 2
+                        {
+                            let inp = tup[0].as_str()?.to_string();
+                            let out = tup[1].as_str()?.to_string();
+                            return Some((inp, out));
                         }
                         let o = ex.as_object()?;
                         let inp = o.get("input")?.as_str()?.to_string();

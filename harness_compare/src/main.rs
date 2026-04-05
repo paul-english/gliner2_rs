@@ -46,10 +46,10 @@ fn main() -> Result<()> {
 
     let model_id = args.get(2).map(String::as_str).unwrap_or(DEFAULT_MODEL_ID);
 
-    let fixtures_json = fs::read_to_string(fixtures_path)
-        .with_context(|| format!("read {}", fixtures_path))?;
-    let fixtures: Vec<Fixture> = serde_json::from_str(&fixtures_json)
-        .context("parse fixtures JSON")?;
+    let fixtures_json =
+        fs::read_to_string(fixtures_path).with_context(|| format!("read {}", fixtures_path))?;
+    let fixtures: Vec<Fixture> =
+        serde_json::from_str(&fixtures_json).context("parse fixtures JSON")?;
 
     let load_start = Instant::now();
     let files = download_model(model_id)?;

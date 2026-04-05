@@ -3,8 +3,8 @@ use candle_core::Device;
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaConfig;
 use gliner2::config::download_model;
-use gliner2::extract::{extract_with_schema, ExtractOptions};
-use gliner2::{infer_metadata_from_schema, Extractor, ExtractorConfig, SchemaTransformer};
+use gliner2::extract::{ExtractOptions, extract_with_schema};
+use gliner2::{Extractor, ExtractorConfig, SchemaTransformer, infer_metadata_from_schema};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
@@ -51,10 +51,10 @@ fn main() -> Result<()> {
 
     let model_id = args.get(2).map(String::as_str).unwrap_or(DEFAULT_MODEL_ID);
 
-    let fixtures_json = fs::read_to_string(fixtures_path)
-        .with_context(|| format!("read {}", fixtures_path))?;
-    let fixtures: Vec<MtFixture> = serde_json::from_str(&fixtures_json)
-        .context("parse multitask fixtures JSON")?;
+    let fixtures_json =
+        fs::read_to_string(fixtures_path).with_context(|| format!("read {}", fixtures_path))?;
+    let fixtures: Vec<MtFixture> =
+        serde_json::from_str(&fixtures_json).context("parse multitask fixtures JSON")?;
 
     let load_start = Instant::now();
     let files = download_model(model_id)?;
@@ -84,14 +84,7 @@ fn main() -> Result<()> {
         };
 
         let infer_start = Instant::now();
-        let result = extract_with_schema(
-            &extractor,
-            &processor,
-            &f.text,
-            &f.schema,
-            &meta,
-            &opts,
-        )?;
+        let result = extract_with_schema(&extractor, &processor, &f.text, &f.schema, &meta, &opts)?;
         let infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
 
         cases_out.push(MtCaseOutput {

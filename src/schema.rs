@@ -2,21 +2,16 @@
 
 use anyhow::{Context, Result as AnyResult};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 /// Field typing for structure / entity metadata (mirrors Python `dtype`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ValueDtype {
     Str,
+    #[default]
     List,
-}
-
-impl Default for ValueDtype {
-    fn default() -> Self {
-        ValueDtype::List
-    }
 }
 
 /// Parsed `extract_json` field spec (string `name::dtype::[choices]::description` or JSON object).
@@ -235,21 +230,15 @@ impl Schema {
     /// Add structures from `extract_json`-style maps: `{ "parent": ["field::str::...", ...], ... }`.
     pub fn extract_json_structures(&mut self, structures: &Map<String, Value>) -> AnyResult<()> {
         for (parent, fields_val) in structures {
-            let arr = fields_val
-                .as_array()
-                .with_context(|| format!("extract_json_structures: {parent:?} must be a JSON array"))?;
+            let arr = fields_val.as_array().with_context(|| {
+                format!("extract_json_structures: {parent:?} must be a JSON array")
+            })?;
             let mut builder = self.structure(parent.clone());
             for spec in arr {
                 let p = parse_field_spec(spec).with_context(|| {
                     format!("extract_json_structures: invalid field spec under {parent:?}")
                 })?;
-                builder.field(
-                    p.name,
-                    p.dtype,
-                    p.choices,
-                    p.description,
-                    None,
-                );
+                builder.field(p.name, p.dtype, p.choices, p.description, None);
             }
         }
         Ok(())
@@ -305,12 +294,12 @@ impl Schema {
                 let mut ent_map = self
                     .inner
                     .remove("entities")
-                    .and_then(|v| v.as_object().map(|o| o.clone()))
+                    .and_then(|v| v.as_object().cloned())
                     .unwrap_or_default();
                 let mut desc_map = self
                     .inner
                     .remove("entity_descriptions")
-                    .and_then(|v| v.as_object().map(|o| o.clone()))
+                    .and_then(|v| v.as_object().cloned())
                     .unwrap_or_default();
                 for (name, cfg) in map {
                     if !self.entity_order.contains(&name) {
@@ -357,7 +346,12 @@ impl Schema {
         cfg.insert("task".into(), json!(task.clone()));
         cfg.insert("labels".into(), json!(label_names.clone()));
         cfg.insert("multi_label".into(), json!(multi_label));
-        cfg.insert("cls_threshold".into(), serde_json::Number::from_f64(cls_threshold as f64).unwrap().into());
+        cfg.insert(
+            "cls_threshold".into(),
+            serde_json::Number::from_f64(cls_threshold as f64)
+                .unwrap()
+                .into(),
+        );
         cfg.insert("true_label".into(), json!(["N/A"]));
         if let Some(descs) = label_descs {
             cfg.insert("label_descriptions".into(), Value::Object(descs));
@@ -390,7 +384,8 @@ impl Schema {
             }
             self.field_orders
                 .insert(name.clone(), vec!["head".into(), "tail".into()]);
-            self.relation_metadata.insert(name, RelationMeta { threshold });
+            self.relation_metadata
+                .insert(name, RelationMeta { threshold });
         };
 
         match relation_types {
@@ -503,6 +498,12 @@ impl<'a> StructureBuilder<'a> {
     }
 }
 
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn parse_entity_config(cfg: &Value) -> (Option<String>, Option<ValueDtype>, Option<f32>) {
     match cfg {
         Value::String(d) => (Some(d.clone()), None, None),
@@ -568,6 +569,79 @@ pub fn create_schema() -> Schema {
     Schema::new()
 }
 
+/// Metadata for a plain schema dict (mirrors Python `batch_extract` when `schema` is a `dict`, not a `Schema` instance).
+pub fn infer_metadata_from_schema(schema: &Value) -> ExtractionMetadata {
+    let mut meta = ExtractionMetadata::default();
+
+    if let Some(ent) = schema.get("entities").and_then(|v| v.as_object()) {
+        meta.entity_order = ent.keys().cloned().collect();
+    }
+
+    if let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) {
+        meta.classification_tasks = arr
+            .iter()
+            .filter_map(|c| c.get("task").and_then(|t| t.as_str()).map(String::from))
+            .collect();
+    }
+
+    if let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) {
+        for st in arr {
+            if let Some(obj) = st.as_object() {
+                for (parent, fields) in obj {
+                    if let Some(fmap) = fields.as_object() {
+                        meta.field_orders
+                            .insert(parent.clone(), fmap.keys().cloned().collect());
+                        for (fname, fval) in fmap {
+                            let key = format!("{parent}.{fname}");
+                            let dtype = fval
+                                .get("dtype")
+                                .and_then(|v| v.as_str())
+                                .map(|s| match s {
+                                    "str" => ValueDtype::Str,
+                                    _ => ValueDtype::List,
+                                })
+                                .unwrap_or(ValueDtype::List);
+                            let threshold = fval
+                                .get("threshold")
+                                .and_then(|v| v.as_f64())
+                                .map(|f| f as f32);
+                            let choices = fval.get("choices").and_then(|c| c.as_array()).map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect::<Vec<_>>()
+                            });
+                            meta.field_metadata.insert(
+                                key.clone(),
+                                FieldMeta {
+                                    dtype,
+                                    threshold,
+                                    choices,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                for (rel_name, _) in obj {
+                    if !meta.relation_order.contains(rel_name) {
+                        meta.relation_order.push(rel_name.clone());
+                    }
+                    meta.field_orders
+                        .insert(rel_name.clone(), vec!["head".into(), "tail".into()]);
+                }
+            }
+        }
+    }
+
+    meta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,10 +670,8 @@ mod tests {
 
     #[test]
     fn parse_field_seating() {
-        let p = parse_field_spec(&json!(
-            "seating::[indoor|outdoor|bar]::Seating preference"
-        ))
-        .unwrap();
+        let p =
+            parse_field_spec(&json!("seating::[indoor|outdoor|bar]::Seating preference")).unwrap();
         assert_eq!(p.name, "seating");
         assert_eq!(p.dtype, ValueDtype::Str);
         assert_eq!(
@@ -659,81 +731,4 @@ mod tests {
         assert!(fields["availability"].get("choices").is_some());
         assert!(meta.field_orders.contains_key("product_info"));
     }
-}
-
-/// Metadata for a plain schema dict (mirrors Python `batch_extract` when `schema` is a `dict`, not a `Schema` instance).
-pub fn infer_metadata_from_schema(schema: &Value) -> ExtractionMetadata {
-    let mut meta = ExtractionMetadata::default();
-
-    if let Some(ent) = schema.get("entities").and_then(|v| v.as_object()) {
-        meta.entity_order = ent.keys().cloned().collect();
-    }
-
-    if let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) {
-        meta.classification_tasks = arr
-            .iter()
-            .filter_map(|c| c.get("task").and_then(|t| t.as_str()).map(String::from))
-            .collect();
-    }
-
-    if let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) {
-        for st in arr {
-            if let Some(obj) = st.as_object() {
-                for (parent, fields) in obj {
-                    if let Some(fmap) = fields.as_object() {
-                        meta.field_orders
-                            .insert(parent.clone(), fmap.keys().cloned().collect());
-                        for (fname, fval) in fmap {
-                            let key = format!("{parent}.{fname}");
-                            let dtype = fval
-                                .get("dtype")
-                                .and_then(|v| v.as_str())
-                                .map(|s| match s {
-                                    "str" => ValueDtype::Str,
-                                    _ => ValueDtype::List,
-                                })
-                                .unwrap_or(ValueDtype::List);
-                            let threshold = fval
-                                .get("threshold")
-                                .and_then(|v| v.as_f64())
-                                .map(|f| f as f32);
-                            let choices = fval
-                                .get("choices")
-                                .and_then(|c| c.as_array())
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|v| v.as_str().map(String::from))
-                                        .collect::<Vec<_>>()
-                                });
-                            meta.field_metadata.insert(
-                                key.clone(),
-                                FieldMeta {
-                                    dtype,
-                                    threshold,
-                                    choices,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                for (rel_name, _) in obj {
-                    if !meta.relation_order.contains(rel_name) {
-                        meta.relation_order.push(rel_name.clone());
-                    }
-                    meta
-                        .field_orders
-                        .insert(rel_name.clone(), vec!["head".into(), "tail".into()]);
-                }
-            }
-        }
-    }
-
-    meta
 }

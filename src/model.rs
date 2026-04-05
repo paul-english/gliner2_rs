@@ -1,10 +1,10 @@
-use candle_core::{DType, Result, Tensor, D};
-use candle_nn::{Activation, Module, Sequential, VarBuilder};
-use candle_transformers::models::debertav2::{DebertaV2Model, Config as DebertaConfig};
 use crate::config::ExtractorConfig;
-use crate::layers::{create_mlp_from_dims, CountEmbed};
+use crate::layers::{CountEmbed, create_mlp_from_dims};
 use crate::processor::FormattedInput;
 use crate::span_rep::SpanMarkerV0;
+use candle_core::{D, DType, Result, Tensor};
+use candle_nn::{Activation, Module, Sequential, VarBuilder};
+use candle_transformers::models::debertav2::{Config as DebertaConfig, DebertaV2Model};
 
 pub struct Extractor {
     encoder: DebertaV2Model,
@@ -26,9 +26,13 @@ impl Extractor {
         let max_width = config.max_width;
 
         let encoder = DebertaV2Model::load(vb.pp("encoder"), &encoder_config)?;
-        
-        let span_rep = SpanMarkerV0::load(hidden_size, max_width, vb.pp("span_rep").pp("span_rep_layer"))?;
-        
+
+        let span_rep = SpanMarkerV0::load(
+            hidden_size,
+            max_width,
+            vb.pp("span_rep").pp("span_rep_layer"),
+        )?;
+
         let classifier = create_mlp_from_dims(
             hidden_size,
             &[hidden_size * 2],
@@ -37,7 +41,7 @@ impl Extractor {
             Activation::Relu,
             vb.pp("classifier"),
         )?;
-        
+
         let count_pred = create_mlp_from_dims(
             hidden_size,
             &[hidden_size * 2],
@@ -46,8 +50,9 @@ impl Extractor {
             Activation::Relu,
             vb.pp("count_pred"),
         )?;
-        
-        let count_embed = CountEmbed::load(&config.counting_layer, hidden_size, vb.pp("count_embed"))?;
+
+        let count_embed =
+            CountEmbed::load(&config.counting_layer, hidden_size, vb.pp("count_embed"))?;
 
         Ok(Self {
             encoder,
@@ -67,34 +72,36 @@ impl Extractor {
         formatted: &FormattedInput,
     ) -> Result<Tensor> {
         // 1. Encode
-        let encoder_output = self.encoder.forward(input_ids, None, Some(attention_mask.clone()))?;
+        let encoder_output = self
+            .encoder
+            .forward(input_ids, None, Some(attention_mask.clone()))?;
         let last_hidden_state = encoder_output; // [B, SeqLen, D]
-        
+
         let device = last_hidden_state.device();
-        
+
         // 2. Extract embeddings
         // For simplicity in this PoC, we handle BatchSize = 1
         let b = last_hidden_state.dim(0)?;
         if b != 1 {
             candle_core::bail!("Only batch size 1 is supported in this PoC");
         }
-        
+
         let last_hidden_state = last_hidden_state.get(0)?; // [SeqLen, D]
-        
+
         // Text word embeddings
         let mut text_word_embs = Vec::new();
         for &pos in &formatted.text_word_first_positions {
             text_word_embs.push(last_hidden_state.get(pos)?);
         }
         let text_word_embs = Tensor::stack(&text_word_embs, 0)?; // [L, D]
-        
+
         // Schema embeddings
         let mut schema_special_embs = Vec::new();
         for &pos in &formatted.schema_special_positions {
             schema_special_embs.push(last_hidden_state.get(pos)?);
         }
         let schema_special_embs = Tensor::stack(&schema_special_embs, 0)?; // [NumSpecial, D]
-        
+
         // 3. Span Rep
         // We need to compute span indices for the text words
         let text_len = text_word_embs.dim(0)?;
@@ -106,24 +113,26 @@ impl Extractor {
             }
         }
         let span_indices = Tensor::new(span_indices, device)?.reshape((1, (), 2))?; // [1, S, 2]
-        
-        let span_rep = self.span_rep.forward(&text_word_embs.unsqueeze(0)?, &span_indices)?; // [1, L, max_width, D]
+
+        let span_rep = self
+            .span_rep
+            .forward(&text_word_embs.unsqueeze(0)?, &span_indices)?; // [1, L, max_width, D]
         let span_rep = span_rep.get(0)?; // [L, max_width, D]
-        
+
         // 4. Predict Count
         let p_emb = schema_special_embs.get(0)?; // [D] - First special token is [P]
         let count_logits = self.count_pred.forward(&p_emb.unsqueeze(0)?)?; // [1, 20]
         let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
-        
+
         if pred_count == 0 {
-            return Ok(Tensor::zeros((text_len, self.max_width), DType::F32, device)?);
+            return Tensor::zeros((text_len, self.max_width), DType::F32, device);
         }
-        
+
         // 5. Count aware project
         // schema_special_embs[1:] are [E] tokens
         let e_embs = schema_special_embs.narrow(0, 1, schema_special_embs.dim(0)? - 1)?; // [NumEntities, D]
         let struct_proj = self.count_embed.forward(&e_embs, pred_count)?; // [pred_count, NumEntities, D]
-        
+
         // 6. Score
         // span_rep: [L, max_width, D]
         // struct_proj: [pred_count, NumEntities, D]
@@ -131,17 +140,19 @@ impl Extractor {
         // scores = sigmoid(einsum("lkd,bpd->bplk", span_rep, struct_proj))
         // Here b=pred_count, p=NumEntities.
         // For NER entities task, we take b=0.
-        
+
         let struct_proj_0 = struct_proj.get(0)?; // [NumEntities, D]
-        
+
         // scores = sigmoid(span_rep @ struct_proj_0.T)
         // span_rep: [L*max_width, D] after flattening
         let flat_span_rep = span_rep.reshape(((), self.hidden_size))?; // [S, D]
-        let scores = flat_span_rep.matmul(&struct_proj_0.t()?)?.apply(&Activation::Sigmoid)?; // [S, NumEntities]
-        
+        let scores = flat_span_rep
+            .matmul(&struct_proj_0.t()?)?
+            .apply(&Activation::Sigmoid)?; // [S, NumEntities]
+
         // Reshape back to [NumEntities, L, max_width]
         let scores = scores.t()?.reshape(((), text_len, self.max_width))?;
-        
+
         Ok(scores)
     }
 
@@ -154,12 +165,9 @@ impl Extractor {
     }
 
     /// Encoder last hidden states `[B, seq, D]`.
-    pub fn encode_sequence(
-        &self,
-        input_ids: &Tensor,
-        attention_mask: &Tensor,
-    ) -> Result<Tensor> {
-        self.encoder.forward(input_ids, None, Some(attention_mask.clone()))
+    pub fn encode_sequence(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        self.encoder
+            .forward(input_ids, None, Some(attention_mask.clone()))
     }
 
     /// First subword embedding per text word: `[L, D]`.

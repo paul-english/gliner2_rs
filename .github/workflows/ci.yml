@@ -1,0 +1,73 @@
+# CI: Rust fmt, Clippy, tests, and Rust vs Python harness comparison.
+#
+# Optional: add a repository secret HF_TOKEN (or HUGGING_FACE_HUB_TOKEN) for higher
+# Hugging Face Hub rate limits or private/gated models. Public model downloads work without it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache uv and Hugging Face Hub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/huggingface
+          key: ${{ runner.os }}-harness-${{ hashFiles('Cargo.lock', 'harness/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-harness-
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: uv sync (harness)
+        working-directory: harness
+        run: uv sync --locked
+
+      - name: Entity harness (Rust vs Python)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: bash harness/run_all.sh
+
+      - name: Multitask harness (Rust vs Python)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: bash harness/run_multitask.sh

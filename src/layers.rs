@@ -1,6 +1,6 @@
-use candle_core::{bail, DType, Result, Tensor, D};
+use candle_core::{D, DType, Result, Tensor, bail};
 use candle_nn::{
-    layer_norm, Activation, Embedding, LayerNorm, Linear, Module, Sequential, VarBuilder,
+    Activation, Embedding, LayerNorm, Linear, Module, Sequential, VarBuilder, layer_norm,
 };
 
 pub fn create_mlp(
@@ -15,14 +15,18 @@ pub fn create_mlp(
     let mut current_dim = in_dim;
 
     for (i, &dim) in intermediate_dims.iter().enumerate() {
-        let linear = candle_nn::linear(current_dim, dim, vb.pp(&format!("0.{}", i * 2)))?; // This naming might be tricky with Sequential
+        let linear = candle_nn::linear(current_dim, dim, vb.pp(format!("0.{}", i * 2)))?; // This naming might be tricky with Sequential
         seq = seq.add(linear);
         seq = seq.add(activation);
         // Dropout is usually a no-op during inference in candle
         current_dim = dim;
     }
 
-    let final_linear = candle_nn::linear(current_dim, out_dim, vb.pp(&(intermediate_dims.len() * 2).to_string()))?;
+    let final_linear = candle_nn::linear(
+        current_dim,
+        out_dim,
+        vb.pp((intermediate_dims.len() * 2).to_string()),
+    )?;
     seq = seq.add(final_linear);
 
     Ok(seq)
@@ -42,25 +46,29 @@ pub fn create_mlp_from_dims(
     let mut layer_idx = 0;
 
     for &dim in intermediate_dims {
-        let linear = candle_nn::linear(in_dim, dim, vb.pp(&format!("{}", layer_idx)))?;
+        let linear = candle_nn::linear(in_dim, dim, vb.pp(format!("{}", layer_idx)))?;
         seq = seq.add(linear);
         layer_idx += 1;
-        
+
         // In the Python implementation, activation and dropout are also layers in Sequential
         seq = seq.add(activation);
         layer_idx += 1;
-        
+
         in_dim = dim;
     }
 
-    let final_linear = candle_nn::linear(in_dim, output_dim, vb.pp(&format!("{}", layer_idx)))?;
+    let final_linear = candle_nn::linear(in_dim, output_dim, vb.pp(format!("{}", layer_idx)))?;
     seq = seq.add(final_linear);
 
     Ok(seq)
 }
 
 /// Matches Python `create_projection_layer`: `Linear → ReLU → Dropout → Linear`; weights at `0` and `3`.
-pub fn create_projection_layer(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Sequential> {
+pub fn create_projection_layer(
+    in_dim: usize,
+    out_dim: usize,
+    vb: VarBuilder,
+) -> Result<Sequential> {
     let hidden = out_dim * 4;
     let mut seq = candle_nn::seq();
     seq = seq.add(candle_nn::linear(in_dim, hidden, vb.pp("0"))?);
@@ -85,7 +93,7 @@ struct TorchEncoderLayer {
 
 impl TorchEncoderLayer {
     fn load(d_model: usize, nhead: usize, dim_feedforward: usize, vb: VarBuilder) -> Result<Self> {
-        if d_model % nhead != 0 {
+        if !d_model.is_multiple_of(nhead) {
             bail!("d_model {d_model} not divisible by nhead {nhead}");
         }
         let head_dim = d_model / nhead;
@@ -162,7 +170,8 @@ impl TorchEncoderLayer {
         let out = attn.matmul(&v)?;
         let out = out.permute([0usize, 2, 1, 3])?;
         let out = out.reshape((n, d_model))?;
-        self.out_proj.forward(&out)?
+        self.out_proj
+            .forward(&out)?
             .reshape((b_sz, seq_len, d_model))
     }
 }
@@ -316,14 +325,22 @@ impl CompileSafeGRU {
 
         for t in 0..seq_len {
             let x_t = x.get(t)?;
-            let gi = x_t.matmul(&self.weight_ih_l0.t()?)?.broadcast_add(&self.bias_ih_l0)?;
-            let gh = h.matmul(&self.weight_hh_l0.t()?)?.broadcast_add(&self.bias_hh_l0)?;
+            let gi = x_t
+                .matmul(&self.weight_ih_l0.t()?)?
+                .broadcast_add(&self.bias_ih_l0)?;
+            let gh = h
+                .matmul(&self.weight_hh_l0.t()?)?
+                .broadcast_add(&self.bias_hh_l0)?;
 
             let gi_chunks = gi.chunk(3, D::Minus1)?;
             let gh_chunks = gh.chunk(3, D::Minus1)?;
 
-            let r = gi_chunks[0].add(&gh_chunks[0])?.apply(&Activation::Sigmoid)?;
-            let z = gi_chunks[1].add(&gh_chunks[1])?.apply(&Activation::Sigmoid)?;
+            let r = gi_chunks[0]
+                .add(&gh_chunks[0])?
+                .apply(&Activation::Sigmoid)?;
+            let z = gi_chunks[1]
+                .add(&gh_chunks[1])?
+                .apply(&Activation::Sigmoid)?;
             let n = gi_chunks[2].add(&r.mul(&gh_chunks[2])?)?.tanh()?;
 
             h = z.ones_like()?.sub(&z)?.mul(&n)?.add(&z.mul(&h)?)?;
@@ -373,17 +390,17 @@ impl CountLSTM {
         let device = pc_emb.device();
         let count_indices = Tensor::arange(0u32, gold_count_val as u32, device)?;
         let pos_seq = self.pos_embedding.forward(&count_indices)?; // (gold_count_val, hidden_size)
-        
+
         // Expand pos_seq: (gold_count_val, M, hidden_size)
         let pos_seq = pos_seq.unsqueeze(1)?.expand(&[gold_count_val, m, d])?;
-        
+
         // Run GRU: (gold_count_val, M, hidden_size)
         let output = self.gru.forward(&pos_seq, pc_emb.clone())?;
-        
+
         // Concatenate: (gold_count_val, M, hidden_size * 2)
         let pc_emb_expanded = pc_emb.unsqueeze(0)?.expand(&[gold_count_val, m, d])?;
         let combined = Tensor::cat(&[&output, &pc_emb_expanded], D::Minus1)?;
-        
+
         self.projector.forward(&combined)
     }
 }
