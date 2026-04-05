@@ -12,34 +12,6 @@ cargo add gliner2
 cargo install gliner2
 ```
 
-## Development
-
-### Pre-commit
-
-Git hooks run the same Rust checks as CI (`cargo fmt`, `cargo clippy` on the workspace) plus [Ruff](https://docs.astral.sh/ruff/) on first-party Python (for example under `harness/`). Paths under `reference/` and `.tickets/` are excluded from hooks.
-
-**Prerequisites:** stable Rust with `rustfmt` and `clippy` (for example `rustup component add rustfmt clippy`).
-
-**Install** [pre-commit](https://pre-commit.com/) (either is fine):
-
-```bash
-uv tool install pre-commit
-```
-
-From the repository root, install the hooks once:
-
-```bash
-pre-commit install
-```
-
-Optionally validate the whole tree:
-
-```bash
-pre-commit run --all-files
-```
-
-If you must commit before fixing Clippy, you can skip that hook: `SKIP=cargo-clippy git commit` (use sparingly; CI still enforces warnings as errors).
-
 ## Recorded speed (comparison harness)
 
 The `[harness/](harness/)` scripts run the same **release** Rust binaries (`harness_compare`, `harness_compare_mt` on CPU) against the PyPI `gliner2` package. Timing fields are wall-clock milliseconds from a single process: `load_model_ms` is one-time load; `infer_ms` is per-fixture forward work (entity harness sums all cases for the total row).
@@ -444,6 +416,34 @@ let out_per = batch_extract(
 For a shared schema you can also call **`extractor.batch_extract(&transformer, &texts, &schema_val, &meta, &opts)`** instead of the free function.
 
 Lower-level reuse: after **`transform_extract`** you can run **`extract_from_preprocessed`** on one sample if you already have encoder outputs and span tensors; see [`src/extract.rs`](src/extract.rs).
+
+## Development
+
+### Pre-commit
+
+Git hooks run the same Rust checks as CI (`cargo fmt`, `cargo clippy` on the workspace) plus [Ruff](https://docs.astral.sh/ruff/) on first-party Python (for example under `harness/`). Paths under `reference/` and `.tickets/` are excluded from hooks.
+
+**Prerequisites:** stable Rust with `rustfmt` and `clippy` (for example `rustup component add rustfmt clippy`).
+
+**Install** [pre-commit](https://pre-commit.com/) (either is fine):
+
+```bash
+uv tool install pre-commit
+```
+
+From the repository root, install the hooks once:
+
+```bash
+pre-commit install
+```
+
+Optionally validate the whole tree:
+
+```bash
+pre-commit run --all-files
+```
+
+If you must commit before fixing Clippy, you can skip that hook: `SKIP=cargo-clippy git commit` (use sparingly; CI still enforces warnings as errors).
 
 ## CLI specification
 
