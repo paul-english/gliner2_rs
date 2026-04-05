@@ -1,6 +1,6 @@
 ---
 id: gli-lwsd
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-04-05T14:25:28Z

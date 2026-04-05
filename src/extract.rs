@@ -1,12 +1,11 @@
 //! Multi-task extraction and `format_results` aligned with `gliner2.inference.engine`.
 
 use crate::Extractor;
+use crate::engine::Gliner2Engine;
 use crate::preprocess::{PreprocessedInput, TaskType, collate_preprocessed};
 use crate::processor::SchemaTransformer;
 use crate::schema::ExtractionMetadata;
 use anyhow::{Context, Result};
-use candle_core::{D, DType, Device, Result as CResult, Tensor};
-use candle_nn::Module;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -19,33 +18,6 @@ pub struct ExtractOptions {
     pub max_len: Option<usize>,
     /// Chunk size for [`Extractor::batch_extract`] and related batch APIs (Python default: 8).
     pub batch_size: usize,
-}
-
-// Nested indices mirror row-major layout from flat[idx]; iterator/clippy refactors obscure that mapping.
-#[allow(clippy::needless_range_loop)]
-fn tensor_to_vec4(t: &Tensor) -> CResult<Vec<Vec<Vec<Vec<f32>>>>> {
-    let dims = t.dims();
-    if dims.len() != 4 {
-        candle_core::bail!("expected 4D tensor");
-    }
-    let b = dims[0];
-    let p = dims[1];
-    let l = dims[2];
-    let k = dims[3];
-    let flat = t.flatten_all()?.to_vec1::<f32>()?;
-    let mut out = vec![vec![vec![vec![0f32; k]; l]; p]; b];
-    let mut idx = 0usize;
-    for bi in 0..b {
-        for pi in 0..p {
-            for li in 0..l {
-                for ki in 0..k {
-                    out[bi][pi][li][ki] = flat[idx];
-                    idx += 1;
-                }
-            }
-        }
-    }
-    Ok(out)
 }
 
 impl Default for ExtractOptions {
@@ -86,15 +58,15 @@ fn sample_needs_span_rep(pre: &PreprocessedInput) -> bool {
 }
 
 /// Decode from one sample’s encoder output and optional span tensor (multi-task heads + `format_results`).
-pub fn extract_from_preprocessed(
-    extractor: &Extractor,
+pub fn extract_from_preprocessed<E: Gliner2Engine>(
+    engine: &E,
     pre: &PreprocessedInput,
-    last_hidden_seq: &Tensor,
-    span_rep: Option<&Tensor>,
+    last_hidden_seq: &E::Tensor,
+    span_rep: Option<&E::Tensor>,
     meta: &ExtractionMetadata,
     opts: &ExtractOptions,
 ) -> Result<Value> {
-    let span_for_tasks: Option<&Tensor> = if sample_needs_span_rep(pre) {
+    let span_for_tasks: Option<&E::Tensor> = if sample_needs_span_rep(pre) {
         Some(span_rep.context("extract_from_preprocessed: span_rep required for span tasks")?)
     } else {
         None
@@ -122,11 +94,7 @@ pub fn extract_from_preprocessed(
             continue;
         }
 
-        let mut embs = Vec::new();
-        for &p in &positions {
-            embs.push(last_hidden_seq.get(p)?);
-        }
-        let embs = Tensor::stack(&embs, 0)?;
+        let embs = engine.stack_schema_token_embeddings(last_hidden_seq, &positions)?;
 
         match task_type {
             TaskType::Classifications => {
@@ -134,14 +102,14 @@ pub fn extract_from_preprocessed(
                     &mut raw,
                     &schema_tokens,
                     &pre.schema_original,
-                    extractor,
+                    engine,
                     &embs,
                     opts.include_confidence,
                 )?;
             }
             TaskType::Entities => {
                 extract_span_task(
-                    extractor,
+                    engine,
                     &mut raw,
                     "entities",
                     &schema_tokens,
@@ -165,7 +133,7 @@ pub fn extract_from_preprocessed(
             TaskType::Relations => {
                 let name = schema_prompt_raw(&schema_tokens);
                 extract_span_task(
-                    extractor,
+                    engine,
                     &mut raw,
                     &name,
                     &schema_tokens,
@@ -189,7 +157,7 @@ pub fn extract_from_preprocessed(
             TaskType::JsonStructures => {
                 let name = schema_prompt_raw(&schema_tokens);
                 extract_span_task(
-                    extractor,
+                    engine,
                     &mut raw,
                     &name,
                     &schema_tokens,
@@ -227,8 +195,8 @@ pub fn extract_from_preprocessed(
 }
 
 /// End-to-end extract: preprocess → encode → heads → optional `format_results`.
-pub fn extract_with_schema(
-    extractor: &Extractor,
+pub fn extract_with_schema<E: Gliner2Engine>(
+    engine: &E,
     transformer: &SchemaTransformer,
     text: &str,
     schema: &Value,
@@ -236,23 +204,20 @@ pub fn extract_with_schema(
     opts: &ExtractOptions,
 ) -> Result<Value> {
     let pre = transformer.transform_extract(text, schema, opts.max_len)?;
-    let device = Device::Cpu;
-    let input_ids = Tensor::new(pre.input_ids.clone(), &device)?.unsqueeze(0)?;
-    let attention_mask = Tensor::ones(input_ids.dims(), DType::I64, &device)?;
+    let (input_ids, attention_mask) = engine.single_sample_inputs(&pre.input_ids)?;
 
-    let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
-    let text_embs =
-        extractor.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
-    let span_rep = extractor.compute_span_rep(&text_embs)?;
+    let hidden = engine.encode_sequence(&input_ids, &attention_mask)?;
+    let text_embs = engine.gather_text_word_embeddings(&hidden, &pre.text_word_first_positions)?;
+    let span_rep = engine.compute_span_rep(&text_embs)?;
 
-    let last_hidden = hidden.get(0)?;
+    let last_hidden = engine.batch_row_hidden(&hidden, 0)?;
     let span_opt = sample_needs_span_rep(&pre).then_some(&span_rep);
-    extract_from_preprocessed(extractor, &pre, &last_hidden, span_opt, meta, opts)
+    extract_from_preprocessed(engine, &pre, &last_hidden, span_opt, meta, opts)
 }
 
 /// Batch extract with Python `batch_extract` semantics: padded encoder passes, batched span rep, per-sample decode.
-pub fn batch_extract(
-    extractor: &Extractor,
+pub fn batch_extract<E: Gliner2Engine>(
+    engine: &E,
     transformer: &SchemaTransformer,
     texts: &[String],
     mode: BatchSchemaMode<'_>,
@@ -280,7 +245,6 @@ pub fn batch_extract(
         BatchSchemaMode::Shared { .. } => {}
     }
 
-    let device = Device::Cpu;
     let bs = opts.batch_size.max(1);
     let mut all_out = Vec::with_capacity(texts.len());
     let mut base = 0usize;
@@ -300,22 +264,21 @@ pub fn batch_extract(
         }
 
         let batch = collate_preprocessed(&pres).expect("non-empty chunk");
-        let input_ids = Tensor::from_vec(
-            batch.input_ids.clone(),
-            (batch.batch_size, batch.max_seq_len),
-            &device,
-        )?;
         let mask_i64: Vec<i64> = batch.attention_mask.iter().map(|&x| x as i64).collect();
-        let attention_mask =
-            Tensor::from_vec(mask_i64, (batch.batch_size, batch.max_seq_len), &device)?;
+        let (input_ids, attention_mask) = engine.batch_inputs(
+            batch.input_ids.clone(),
+            mask_i64,
+            batch.batch_size,
+            batch.max_seq_len,
+        )?;
 
-        let hidden = extractor.encode_sequence(&input_ids, &attention_mask)?;
+        let hidden = engine.encode_sequence(&input_ids, &attention_mask)?;
 
-        let mut span_emb_list: Vec<Tensor> = Vec::new();
+        let mut span_emb_list: Vec<E::Tensor> = Vec::new();
         let mut span_orig_index: Vec<usize> = Vec::new();
         for (i, pre) in batch.samples.iter().enumerate() {
             if sample_needs_span_rep(pre) {
-                let tw = extractor.gather_text_word_embeddings_batch_idx(
+                let tw = engine.gather_text_word_embeddings_batch_idx(
                     &hidden,
                     i,
                     &pre.text_word_first_positions,
@@ -328,19 +291,20 @@ pub fn batch_extract(
         let batched_spans = if span_emb_list.is_empty() {
             vec![]
         } else {
-            extractor.compute_span_rep_batched(&span_emb_list)?
+            engine.compute_span_rep_batched(&span_emb_list)?
         };
 
-        let mut span_by_sample: Vec<Option<Tensor>> = (0..batch.batch_size).map(|_| None).collect();
+        let mut span_by_sample: Vec<Option<E::Tensor>> =
+            (0..batch.batch_size).map(|_| None).collect();
         for (k, &orig_i) in span_orig_index.iter().enumerate() {
             span_by_sample[orig_i] = Some(batched_spans[k].clone());
         }
 
         for i in 0..batch.batch_size {
             let pre = &batch.samples[i];
-            let last_h = hidden.get(i)?;
+            let last_h = engine.batch_row_hidden(&hidden, i)?;
             let meta = metas_chunk[i];
-            let span_ref: Option<&Tensor> = if sample_needs_span_rep(pre) {
+            let span_ref: Option<&E::Tensor> = if sample_needs_span_rep(pre) {
                 Some(
                     span_by_sample[i]
                         .as_ref()
@@ -349,7 +313,7 @@ pub fn batch_extract(
             } else {
                 None
             };
-            let v = extract_from_preprocessed(extractor, pre, &last_h, span_ref, meta, opts)?;
+            let v = extract_from_preprocessed(engine, pre, &last_h, span_ref, meta, opts)?;
             all_out.push(v);
         }
 
@@ -407,25 +371,25 @@ fn build_cls_fields(schema: &Value) -> HashMap<String, Vec<String>> {
     m
 }
 
-fn extract_classification(
+fn extract_classification<E: Gliner2Engine>(
     results: &mut Map<String, Value>,
     schema_tokens: &[String],
     schema: &Value,
-    extractor: &Extractor,
-    embs: &Tensor,
+    engine: &E,
+    embs: &E::Tensor,
     include_confidence: bool,
-) -> CResult<()> {
+) -> Result<()> {
     let prompt = schema_prompt_raw(schema_tokens);
     let Some(cls) = find_classification_config(schema, &prompt) else {
         return Ok(());
     };
-    let n = embs.dim(0)?;
+    let n = engine.tensor_dim0(embs)?;
     if n < 2 {
         return Ok(());
     }
-    let cls_embeds = embs.narrow(0, 1, n - 1)?;
-    let logits = extractor.classifier_logits(&cls_embeds)?;
-    let logits_v = logits.to_vec1::<f32>()?;
+    let cls_embeds = engine.tensor_narrow0(embs, 1, n - 1)?;
+    let logits = engine.classifier_logits(&cls_embeds)?;
+    let logits_v = engine.tensor_logits_1d(&logits)?;
     let labels: Vec<String> = cls
         .get("labels")
         .and_then(|v| v.as_array())
@@ -531,13 +495,13 @@ fn find_classification_config<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_span_task(
-    extractor: &Extractor,
+fn extract_span_task<E: Gliner2Engine>(
+    engine: &E,
     results: &mut Map<String, Value>,
     schema_name: &str,
     schema_tokens: &[String],
-    embs: &Tensor,
-    span_rep: &Tensor,
+    embs: &E::Tensor,
+    span_rep: &E::Tensor,
     task_type: &TaskType,
     l_words: usize,
     text_len: usize,
@@ -551,26 +515,25 @@ fn extract_span_task(
     cls_fields: &HashMap<String, Vec<String>>,
     include_confidence: bool,
     include_spans: bool,
-) -> CResult<()> {
+) -> Result<()> {
     let field_names = field_names_from_schema_tokens(schema_tokens);
     if field_names.is_empty() {
         insert_empty_span_result(results, schema_name, task_type);
         return Ok(());
     }
 
-    let p_emb = embs.get(0)?;
-    let count_logits = extractor.count_pred.forward(&p_emb.unsqueeze(0)?)?;
-    let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
+    let p_emb = engine.tensor_index0(embs, 0)?;
+    let pred_count = engine.count_predict(&p_emb)?;
 
     if pred_count == 0 {
         insert_empty_span_result(results, schema_name, task_type);
         return Ok(());
     }
 
-    let n = embs.dim(0)?;
-    let field_embs = embs.narrow(0, 1, n - 1)?;
-    let span_scores = extractor.span_scores_sigmoid(span_rep, &field_embs, pred_count)?;
-    let scores_v = tensor_to_vec4(&span_scores)?;
+    let n = engine.tensor_dim0(embs)?;
+    let field_embs = engine.tensor_narrow0(embs, 1, n - 1)?;
+    let span_scores = engine.span_scores_sigmoid(span_rep, &field_embs, pred_count)?;
+    let scores_v = engine.tensor_span_scores_to_vec4(&span_scores)?;
 
     match task_type {
         TaskType::Entities => {
@@ -667,7 +630,7 @@ fn extract_entities_inner(
     meta: &ExtractionMetadata,
     include_confidence: bool,
     include_spans: bool,
-) -> CResult<Value> {
+) -> Result<Value> {
     let b = 0usize;
     let slice_l = l_words.saturating_sub(text_len);
     let mut entity_map = Map::new();
@@ -850,7 +813,7 @@ fn extract_relations_inner(
     meta: &ExtractionMetadata,
     include_confidence: bool,
     include_spans: bool,
-) -> CResult<Value> {
+) -> Result<Value> {
     let slice_l = l_words.saturating_sub(text_len);
     let rel_threshold = meta
         .relation_metadata
@@ -947,7 +910,7 @@ fn extract_structures_inner(
     cls_fields: &HashMap<String, Vec<String>>,
     include_confidence: bool,
     include_spans: bool,
-) -> CResult<Value> {
+) -> Result<Value> {
     let slice_l = l_words.saturating_sub(text_len);
     let ordered: Vec<String> = meta
         .field_orders

@@ -62,8 +62,13 @@ def _ms(x: Any) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("rust_json")
+    ap.add_argument("rust_json", help="harness_compare_mt JSON (Candle)")
     ap.add_argument("python_json")
+    ap.add_argument(
+        "--rust-tch",
+        metavar="PATH",
+        help="Optional harness_compare_mt --backend tch JSON",
+    )
     ap.add_argument("--tolerance", type=float, default=1e-3)
     ap.add_argument("--warn-only", action="store_true")
     args = ap.parse_args()
@@ -72,12 +77,23 @@ def main() -> int:
         rust = json.load(f)
     with open(args.python_json, encoding="utf-8") as f:
         py = json.load(f)
+    rust_tch = None
+    if args.rust_tch:
+        with open(args.rust_tch, encoding="utf-8") as f:
+            rust_tch = json.load(f)
 
     print("--- metadata ---")
     print(
-        f"rust:   runner={rust.get('runner')} model_id={rust.get('model_id')} "
-        f"device={rust.get('device_note')} load_ms={_ms(rust.get('load_model_ms')):.3f}"
+        f"rust (candle): runner={rust.get('runner')} backend={rust.get('backend', 'candle')} "
+        f"model_id={rust.get('model_id')} device={rust.get('device_note')} "
+        f"load_ms={_ms(rust.get('load_model_ms')):.3f}"
     )
+    if rust_tch:
+        print(
+            f"rust (tch):    runner={rust_tch.get('runner')} backend={rust_tch.get('backend', 'tch')} "
+            f"model_id={rust_tch.get('model_id')} device={rust_tch.get('device_note')} "
+            f"load_ms={_ms(rust_tch.get('load_model_ms')):.3f}"
+        )
     print(
         f"python: runner={py.get('runner')} model_id={py.get('model_id')} "
         f"device={py.get('device_note')} load_ms={_ms(py.get('load_model_ms')):.3f}"
@@ -105,19 +121,38 @@ def main() -> int:
         r_ms = float(rc.get("infer_ms", 0))
         p_ms = float(pc.get("infer_ms", 0))
         ratio = (p_ms / r_ms) if r_ms > 0 else float("inf")
-        print(
-            f"  timing: rust infer_ms={r_ms:.3f} python infer_ms={p_ms:.3f} "
-            f"(python/rust={ratio:.3f}x)"
-        )
+        if rust_tch:
+            tc = {c["id"]: c for c in rust_tch.get("cases", [])}.get(cid)
+            t_ms = float(tc.get("infer_ms", 0)) if tc else 0.0
+            ratio_ct = (t_ms / r_ms) if r_ms > 0 else float("inf")
+            ratio_pt = (p_ms / t_ms) if t_ms > 0 else float("inf")
+            print(
+                f"  timing: rust_candle infer_ms={r_ms:.3f} rust_tch infer_ms={t_ms:.3f} "
+                f"python infer_ms={p_ms:.3f} (tch/candle={ratio_ct:.3f}x python/tch={ratio_pt:.3f}x)"
+            )
+        else:
+            print(
+                f"  timing: rust infer_ms={r_ms:.3f} python infer_ms={p_ms:.3f} "
+                f"(python/rust={ratio:.3f}x)"
+            )
 
     r_total = sum(float(c.get("infer_ms", 0)) for c in rust.get("cases", []))
     p_total = sum(float(c.get("infer_ms", 0)) for c in py.get("cases", []))
     print()
     print("--- total infer_ms (sum of cases) ---")
-    print(
-        f"rust: {r_total:.3f}  python: {p_total:.3f}  "
-        f"ratio: {(p_total / r_total if r_total else float('inf')):.3f}x"
-    )
+    if rust_tch:
+        t_total = sum(float(c.get("infer_ms", 0)) for c in rust_tch.get("cases", []))
+        print(
+            f"rust_candle: {r_total:.3f}  rust_tch: {t_total:.3f}  python: {p_total:.3f}  "
+            f"python/candle: {(p_total / r_total if r_total else float('inf')):.3f}x  "
+            f"tch/candle: {(t_total / r_total if r_total else float('inf')):.3f}x  "
+            f"python/tch: {(p_total / t_total if t_total else float('inf')):.3f}x"
+        )
+    else:
+        print(
+            f"rust: {r_total:.3f}  python: {p_total:.3f}  "
+            f"ratio: {(p_total / r_total if r_total else float('inf')):.3f}x"
+        )
 
     if args.warn_only:
         return 0

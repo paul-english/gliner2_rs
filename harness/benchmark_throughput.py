@@ -58,7 +58,9 @@ def main() -> int:
             else "cpu"
         )
 
-    fixtures_path = args.fixtures or str(Path(__file__).resolve().parent / "fixtures.json")
+    fixtures_path = args.fixtures or str(
+        Path(__file__).resolve().parent / "fixtures.json"
+    )
     texts = load_texts(fixtures_path, args.samples)
     threshold = 0.5
 

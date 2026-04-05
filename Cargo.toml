@@ -1,6 +1,6 @@
 [package]
 name = "gliner2"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.87"
 description = "Rust implementation of GLiNER2 with compatibility for upstream weights and Python training output."
@@ -14,16 +14,21 @@ include = [
     "/LICENSE",
     "/README.md",
     "/src/*.rs",
+    "/src/candle/**/*.rs",
+    "/src/tch_backend/*.rs",
 ]
+
+# Note: `tch` pulls LibTorch (see torch-sys). Use `--features tch` when LibTorch is installed, or
+# add `--features download-libtorch` so `torch-sys` downloads a matching LibTorch (see harness scripts).
 
 [workspace]
 members = ["harness_compare", "scripts/list_keys"]
 resolver = "2"
 
 [dependencies]
-candle-core = "0.8"
-candle-nn = "0.8"
-candle-transformers = "0.8"
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
 hf-hub = "0.4"
 tokenizers = "0.21"
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +37,21 @@ anyhow = "1"
 regex = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+rust-bert = { version = "0.23", default-features = false, optional = true }
+tch = { version = "0.17", optional = true }
+safetensors = { version = "0.4", optional = true }
+clap = { version = "4", features = ["derive", "env"] }
+
+[features]
+default = ["candle"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+tch = ["dep:rust-bert", "dep:tch", "dep:safetensors"]
+download-libtorch = ["tch?/download-libtorch", "rust-bert?/download-libtorch"]
+
+[[test]]
+name = "tch_parity"
+required-features = ["candle", "tch"]
+
+[[test]]
+name = "batch_parity"
+required-features = ["candle"]

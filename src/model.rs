@@ -10,7 +10,7 @@ pub struct Extractor {
     encoder: DebertaV2Model,
     span_rep: SpanMarkerV0,
     classifier: Sequential,
-    pub(crate) count_pred: Sequential,
+    count_pred: Sequential,
     count_embed: CountEmbed,
     hidden_size: usize,
     max_width: usize,
@@ -71,16 +71,20 @@ impl Extractor {
         attention_mask: &Tensor,
         formatted: &FormattedInput,
     ) -> Result<Tensor> {
-        // 1. Encode
         let encoder_output = self
             .encoder
             .forward(input_ids, None, Some(attention_mask.clone()))?;
-        let last_hidden_state = encoder_output; // [B, SeqLen, D]
+        self.forward_from_encoder_output(&encoder_output, formatted)
+    }
 
+    /// NER PoC heads from encoder output `[B, seq, D]` (batch size 1).
+    pub fn forward_from_encoder_output(
+        &self,
+        last_hidden_state: &Tensor,
+        formatted: &FormattedInput,
+    ) -> Result<Tensor> {
         let device = last_hidden_state.device();
 
-        // 2. Extract embeddings
-        // For simplicity in this PoC, we handle BatchSize = 1
         let b = last_hidden_state.dim(0)?;
         if b != 1 {
             candle_core::bail!("Only batch size 1 is supported in this PoC");
@@ -88,22 +92,18 @@ impl Extractor {
 
         let last_hidden_state = last_hidden_state.get(0)?; // [SeqLen, D]
 
-        // Text word embeddings
         let mut text_word_embs = Vec::new();
         for &pos in &formatted.text_word_first_positions {
             text_word_embs.push(last_hidden_state.get(pos)?);
         }
         let text_word_embs = Tensor::stack(&text_word_embs, 0)?; // [L, D]
 
-        // Schema embeddings
         let mut schema_special_embs = Vec::new();
         for &pos in &formatted.schema_special_positions {
             schema_special_embs.push(last_hidden_state.get(pos)?);
         }
         let schema_special_embs = Tensor::stack(&schema_special_embs, 0)?; // [NumSpecial, D]
 
-        // 3. Span Rep
-        // We need to compute span indices for the text words
         let text_len = text_word_embs.dim(0)?;
         let mut span_indices = Vec::new();
         for i in 0..text_len {
@@ -119,38 +119,25 @@ impl Extractor {
             .forward(&text_word_embs.unsqueeze(0)?, &span_indices)?; // [1, L, max_width, D]
         let span_rep = span_rep.get(0)?; // [L, max_width, D]
 
-        // 4. Predict Count
-        let p_emb = schema_special_embs.get(0)?; // [D] - First special token is [P]
+        let p_emb = schema_special_embs.get(0)?; // [D]
         let count_logits = self.count_pred.forward(&p_emb.unsqueeze(0)?)?; // [1, 20]
         let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
 
+        let num_entities = schema_special_embs.dim(0)? - 1;
         if pred_count == 0 {
-            return Tensor::zeros((text_len, self.max_width), DType::F32, device);
+            return Tensor::zeros((num_entities, text_len, self.max_width), DType::F32, device);
         }
 
-        // 5. Count aware project
-        // schema_special_embs[1:] are [E] tokens
-        let e_embs = schema_special_embs.narrow(0, 1, schema_special_embs.dim(0)? - 1)?; // [NumEntities, D]
+        let e_embs = schema_special_embs.narrow(0, 1, num_entities)?; // [NumEntities, D]
         let struct_proj = self.count_embed.forward(&e_embs, pred_count)?; // [pred_count, NumEntities, D]
-
-        // 6. Score
-        // span_rep: [L, max_width, D]
-        // struct_proj: [pred_count, NumEntities, D]
-        // We want scores for entities (task 0 in our PoC)
-        // scores = sigmoid(einsum("lkd,bpd->bplk", span_rep, struct_proj))
-        // Here b=pred_count, p=NumEntities.
-        // For NER entities task, we take b=0.
 
         let struct_proj_0 = struct_proj.get(0)?; // [NumEntities, D]
 
-        // scores = sigmoid(span_rep @ struct_proj_0.T)
-        // span_rep: [L*max_width, D] after flattening
         let flat_span_rep = span_rep.reshape(((), self.hidden_size))?; // [S, D]
         let scores = flat_span_rep
             .matmul(&struct_proj_0.t()?)?
             .apply(&Activation::Sigmoid)?; // [S, NumEntities]
 
-        // Reshape back to [NumEntities, L, max_width]
         let scores = scores.t()?.reshape(((), text_len, self.max_width))?;
 
         Ok(scores)
@@ -315,5 +302,12 @@ impl Extractor {
         }
         let stacked = Tensor::cat(&planes, 0)?;
         stacked.apply(&Activation::Sigmoid)
+    }
+
+    /// Count head: argmax over 20 logits for the `[P]` token embedding (single row `[D]`).
+    pub fn count_predict(&self, p_embedding: &Tensor) -> Result<usize> {
+        let count_logits = self.count_pred.forward(&p_embedding.unsqueeze(0)?)?;
+        let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
+        Ok(pred_count)
     }
 }

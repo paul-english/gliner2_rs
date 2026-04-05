@@ -1,8 +1,8 @@
 # Gliner2 Rust
 
-[![Latest version](https://img.shields.io/crates/v/gliner2.svg)](https://crates.io/crates/gliner2)
-[![Documentation](https://docs.rs/gliner2/badge.svg)](https://docs.rs/gliner2)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](https://github.com/huggingface/gliner2/blob/main/LICENSE)
+[Latest version](https://crates.io/crates/gliner2)
+[Documentation](https://docs.rs/gliner2)
+[License](https://github.com/huggingface/gliner2/blob/main/LICENSE)
 
 This project implements the [Gliner2](https://github.com/fastino-ai/GLiNER2) model in rust with compatibility to the original weights and output of the python training.
 
@@ -10,6 +10,8 @@ This project implements the [Gliner2](https://github.com/fastino-ai/GLiNER2) mod
 cargo add gliner2
 # and/or for a cli utility
 cargo install gliner2
+# LibTorch encoder for the example binary: cargo install gliner2 --features tch
+# then: gliner2 --backend tch   (or GLINER2_BACKEND=tch)
 ```
 
 ## Recorded speed (comparison harness)
@@ -24,45 +26,51 @@ bash harness/run_all.sh
 bash harness/run_multitask.sh
 ```
 
+**Rust (tch-rs) timings in the tables:** set `GLINER2_BENCH_TCH=1` when running the scripts above and `bash harness/run_throughput.sh`. The harness rebuilds `harness_compare` / `harness_throughput` with `--features tch-backend,download-libtorch`, so `torch-sys` downloads a **CPU LibTorch** that matches the pinned `tch` crate (no system LibTorch required). Before running the release binaries, the scripts source [harness/prepend_libtorch_ld_path.sh](harness/prepend_libtorch_ld_path.sh) so the dynamic loader can find `libtorch_cpu.so` under `target/release/build/torch-sys-*/out/...`. Alternatively, install LibTorch yourself and set `LIBTORCH` / `LD_LIBRARY_PATH`; then build with `tch-backend` only (omit `download-libtorch`).
+
+**Entity/multitask compare vs tch:** `compare.py` / `compare_mt.py` check **Candle Rust vs Python** for correctness. The tch JSON is used for **extra timing columns** only. On the current LibTorch encoder bridge, **NER fixture outputs from `--backend tch` can be empty or otherwise diverge from Candle** while wall-clock `infer_ms` is still meaningful. To run the full shell flow without failing on unrelated checks, use `GLINER2_COMPARE_WARN_ONLY=1` with `run_all.sh` / `run_multitask.sh` when needed.
+
 The shell wrappers call Python with `CUDA_VISIBLE_DEVICES=` and `--device cpu` so PyTorch does not use a discrete NVIDIA GPU and weights stay on CPU, matching the Rust side.
 
 For **apples-to-apples timing** with the Rust single-forward path, Python uses `**batch_size=1`**: `batch_extract_entities([text], …, batch_size=1)` on the entity harness and `batch_extract([text], schema, batch_size=1, …)` on the multitask harness (instead of relying on `extract` / `extract_entities` defaults).
 
-**Reading `python/rust`:** for infer times this is `(python infer_ms) / (rust infer_ms)` per case or for the total line. Values **below 1** mean Python spent less time on that measure for these fixtures; **above 1** mean Python was slower.
+**Reading ratios:** for infer times, `python/candle` is `(python infer_ms) / (rust Candle infer_ms)` per case or for the total line. Values **below 1** mean Python spent less time on that measure for these fixtures; **above 1** mean Python was slower. With `GLINER2_BENCH_TCH=1`, `compare.py` / `compare_mt.py` also print `tch/candle` and `python/tch`.
 
 ### CPU vs CPU (recorded)
 
-Model: `fastino/gliner2-base-v1`. **Recorded:** 2026-04-05 (Linux x86_64, local run; numbers vary by machine and load).
+Model: `fastino/gliner2-base-v1`. **Recorded:** 2026-04-05 (Linux x86_64, local run; numbers vary by machine and load). **tch-rs `infer_ms`:** LibTorch encoder path with `download-libtorch` + [prepend_libtorch_ld_path.sh](harness/prepend_libtorch_ld_path.sh); see caveat above on NER outputs vs Candle.
 
 **Entity harness** ([harness/fixtures.json](harness/fixtures.json)) — metadata and per-case infer times:
 
 
-|                              | Rust  | Python     |
-| ---------------------------- | ----- | ---------- |
-| `device_note`                | `cpu` | `cpu`      |
-| `load_model_ms`              | 445.0 | 3874.4     |
-| Sum of `infer_ms` over cases | 569.9 | 358.7      |
-| `python/rust` (total infer)  | —     | **0.629×** |
+|                              | Rust (Candle) | Rust (tch-rs)   | Python           |
+| ---------------------------- | ------------- | --------------- | ---------------- |
+| `device_note`                | `cpu`         | `cpu_libtorch`† | `cpu`            |
+| `load_model_ms`              | 494.0         | 1544.3          | 17435.6          |
+| Sum of `infer_ms` over cases | 678.2         | 325.6           | 647.7            |
+| Ratios (total infer)         | —             | tch/cnd **0.48×** | py/cnd **0.95×**; py/tch **1.99×** |
 
 
+† Expected device label for the tch harness JSON when `GLINER2_BENCH_TCH=1` is enabled.
 
-| Case id             | rust `infer_ms` | python `infer_ms` | `python/rust` |
-| ------------------- | --------------- | ----------------- | ------------- |
-| `steve_jobs`        | 140.0           | 118.9             | 0.849×        |
-| `tim_cook_iphone`   | 151.1           | 85.6              | 0.566×        |
-| `sundar_pichai`     | 144.3           | 78.8              | 0.546×        |
-| `microsoft_windows` | 134.4           | 75.4              | 0.561×        |
+
+| Case id             | Candle `infer_ms` | tch-rs `infer_ms` | python `infer_ms` | `python/candle` |
+| ------------------- | ----------------- | ----------------- | ----------------- | --------------- |
+| `steve_jobs`        | 178.2             | 86.6              | 402.4             | 2.26×           |
+| `tim_cook_iphone`   | 183.6             | 84.4              | 85.3              | 0.46×           |
+| `sundar_pichai`     | 163.3             | 80.6              | 83.7              | 0.51×           |
+| `microsoft_windows` | 153.1             | 74.0              | 76.3              | 0.50×           |
 
 
 **Multitask harness** ([harness/fixtures_multitask.json](harness/fixtures_multitask.json)) — single fixture `entities_plus_sentiment`:
 
 
-|                             | Rust  | Python     |
-| --------------------------- | ----- | ---------- |
-| `device_note`               | `cpu` | `cpu`      |
-| `load_model_ms`             | 409.5 | 4002.4     |
-| Sum of `infer_ms`           | 157.5 | 113.9      |
-| `python/rust` (total infer) | —     | **0.724×** |
+|                      | Rust (Candle) | Rust (tch-rs)   | Python           |
+| -------------------- | ------------- | --------------- | ---------------- |
+| `device_note`        | `cpu`         | `cpu_libtorch`† | `cpu`            |
+| `load_model_ms`      | 435.2         | 2020.4          | 4619.1           |
+| Sum of `infer_ms`    | 208.5         | 484.5           | 144.4            |
+| Ratios (total infer) | —             | tch/cnd **2.32×** | py/cnd **0.69×**; py/tch **0.30×** |
 
 
 These are **short-fixture** timings. Update the tables when you change the model, fixtures, or harness code in a way that affects performance.
@@ -80,20 +88,20 @@ bash harness/run_throughput.sh
 
 Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [rust_batch_out.json] [samples]`. The script runs [harness/compare_throughput.py](harness/compare_throughput.py) on the three JSON outputs.
 
-**Recorded:** 2026-04-05 (Linux x86_64, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=2` over all samples before each timed pass.
+Rust JSON includes a `backend` field (`candle` or `tch`). For LibTorch encoder timing only, set `GLINER2_THROUGHPUT_BACKEND=tch` (builds with `tch-backend,download-libtorch`). For **both** Rust backends plus Python in one run, use `GLINER2_BENCH_TCH=1 bash harness/run_throughput.sh`. You can also pass `--backend candle|tch` directly to `harness_throughput`.
+
+**Recorded:** 2026-04-05 (Linux x86_64, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=2` over all samples before each timed pass. [harness/compare_throughput.py](harness/compare_throughput.py) prints Candle vs tch vs Python (ratios: `py/cnd`, `tch/cnd`, `py/tch`).
 
 
-| Lane                               | `total_infer_ms` (64 samples) | samples/s | `python/rust` (infer) |
-| ---------------------------------- | ----------------------------- | --------- | --------------------- |
-| Rust sequential (`batch_size` 1)   | 8813.2                        | 7.26      | —                     |
-| Python sequential (`batch_size` 1) | 4843.0                        | 13.22     | **0.550×**            |
-| Rust batched (`batch_size` 64)     | 6794.2                        | 9.42      | —                     |
-| Python batched (`batch_size` 64)   | 1650.6                        | 38.78     | **0.243×**            |
+| Lane                        | Candle `total_infer_ms` (64) | tch-rs `total_infer_ms` (64) | Python `total_infer_ms` (64) | Candle samples/s | py/candle infer |
+| --------------------------- | ---------------------------- | ---------------------------- | ---------------------------- | ---------------- | --------------- |
+| Sequential (`batch_size` 1) | 11287.2                      | 6828.3                       | 7581.7                       | 5.67             | **0.67×**       |
+| Batched (`batch_size` 64)   | 9377.5                       | 2953.5                       | 2404.9                       | 6.82             | **0.26×**       |
 
 
-Load times from that run: Rust sequential ~492 ms, Rust batched ~467 ms, Python ~2613 ms.
+Load times from that run: Rust Candle sequential ~425 ms, batched ~458 ms; Rust tch sequential ~1759 ms, batched ~1779 ms; Python ~3048 ms.
 
-Re-run `bash harness/run_throughput.sh` to refresh; the script prints the same layout via [harness/compare_throughput.py](harness/compare_throughput.py).
+Re-run `bash harness/run_throughput.sh` for Candle-only Rust, or `GLINER2_BENCH_TCH=1 bash harness/run_throughput.sh` to refresh all three lanes (bundled LibTorch via `download-libtorch`).
 
 ### GPU vs GPU (not recorded yet)
 
@@ -308,9 +316,9 @@ let out = extractor.extract(&transformer, text, &schema_val, &meta, &opts)?;
 
 ### Batch inference
 
-The crate mirrors Python’s batched entry points: records are preprocessed, **padded into chunks** of at most `ExtractOptions::batch_size` (default **8**), the encoder runs **once per chunk**, span representations are computed with **`compute_span_rep_batched`** when needed, then each row is decoded. Results are returned in **input order**.
+The crate mirrors Python’s batched entry points: records are preprocessed, **padded into chunks** of at most `ExtractOptions::batch_size` (default **8**), the encoder runs **once per chunk**, span representations are computed with `**compute_span_rep_batched`** when needed, then each row is decoded. Results are returned in **input order**.
 
-Set `batch_size` on `ExtractOptions` for any batch method (it only affects chunking, not single-sample `extract_*` calls).
+Set `batch_size` on `ExtractOptions` for any batch method (it only affects chunking, not single-sample `extract_`* calls).
 
 #### Shared schema (one schema for every text)
 
@@ -360,7 +368,7 @@ let json_results = extractor.batch_extract_json(&transformer, &texts, &structure
 
 #### Full schema + metadata (`batch_extract`)
 
-For the same multitask flow as [`extract`](#multi-task-builder-create_schema--extract), build `(schema_val, meta)` once and run **`batch_extract`** with **`BatchSchemaMode::Shared`**, or pass per-row schemas and metadata with **`BatchSchemaMode::PerSample`**.
+For the same multitask flow as `[extract](#multi-task-builder-create_schema--extract)`, build `(schema_val, meta)` once and run `**batch_extract**` with `**BatchSchemaMode::Shared**`, or pass per-row schemas and metadata with `**BatchSchemaMode::PerSample**`.
 
 ```rust
 use gliner2::{batch_extract, create_schema, BatchSchemaMode, ExtractOptions};
@@ -413,9 +421,9 @@ let out_per = batch_extract(
 )?;
 ```
 
-For a shared schema you can also call **`extractor.batch_extract(&transformer, &texts, &schema_val, &meta, &opts)`** instead of the free function.
+For a shared schema you can also call `**extractor.batch_extract(&transformer, &texts, &schema_val, &meta, &opts)**` instead of the free function.
 
-Lower-level reuse: after **`transform_extract`** you can run **`extract_from_preprocessed`** on one sample if you already have encoder outputs and span tensors; see [`src/extract.rs`](src/extract.rs).
+Lower-level reuse: after `**transform_extract**` you can run `**extract_from_preprocessed**` on one sample if you already have encoder outputs and span tensors; see `[src/extract.rs](src/extract.rs)`.
 
 ## Development
 
@@ -447,7 +455,7 @@ If you must commit before fixing Clippy, you can skip that hook: `SKIP=cargo-cli
 
 ## CLI specification
 
-The command-line interface is **not implemented yet**. This section specifies the intended `gliner2` binary (see `default-run` in `Cargo.toml`) so future work can match the library API and Python `GLiNER2` behavior.
+The command-line interface `gliner2` offers another way to run for a handful or input types.
 
 Install the binary with `cargo install gliner2`. Inference flags mirror [ExtractOptions](src/extract.rs) (`threshold`, `format_results`, `include_confidence`, `include_spans`, `max_len`).
 
@@ -488,12 +496,12 @@ Top-level: `gliner2 --help`, `gliner2 --version`, and `gliner2 <subcommand> --he
 These apply to every subcommand unless stated otherwise.
 
 
-| Flag                                                       | Description                                                                                                                                                       |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--model <HF_REPO_ID>`                                     | Hugging Face model id (default: `fastino/gliner2-base-v1`, same as `harness/` scripts).                                                                           |
+| Flag                                                       | Description                                                                                                                                                     |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--model <HF_REPO_ID>`                                     | Hugging Face model id (default: `fastino/gliner2-base-v1`, same as `harness/` scripts).                                                                         |
 | `--model-dir <DIR>`                                        | Offline layout: `config.json`, `encoder_config/config.json`, `tokenizer.json`, `model.safetensors` (matches `ModelFiles` from [download_model](src/config.rs)). |
-| `--config`, `--encoder-config`, `--tokenizer`, `--weights` | Explicit paths instead of `--model` / `--model-dir`.                                                                                                              |
-| `-q`, `-v` / `--log-level`                                 | Quiet / verbose logging (exact mapping is implementation-defined).                                                                                                |
+| `--config`, `--encoder-config`, `--tokenizer`, `--weights` | Explicit paths instead of `--model` / `--model-dir`.                                                                                                            |
+| `-q`, `-v` / `--log-level`                                 | Quiet / verbose logging (exact mapping is implementation-defined).                                                                                              |
 
 
 Use either Hub resolution (`--model`) **or** a local layout (`--model-dir` or explicit file flags), not a conflicting mix; if both are given, the implementation should reject the invocation with a clear error.
@@ -613,8 +621,8 @@ Field specs use the same grammar as **Structured JSON (`extract_json`)** above: 
 #### `gliner2 run`
 
 
-| Flag                   | Description                                                                                                                                                                                                                                                                                                             |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flag                   | Description                                                                                                                                                                                                                                                                                                           |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--schema-file <PATH>` | Required. Full **engine** multitask schema (same shape as Python `GLiNER2.extract(text, schema)`). See [harness/fixtures_multitask.json](harness/fixtures_multitask.json) for a minimal example: `entities`, `classifications`, `relations`, `json_structures`, optional `entity_descriptions` / `json_descriptions`. |
 
 

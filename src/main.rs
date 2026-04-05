@@ -1,68 +1,619 @@
-use anyhow::Result;
-use candle_core::{Device, Tensor};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use candle_core::Device;
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaConfig;
-use gliner2::config::download_model;
-use gliner2::{Extractor, ExtractorConfig, SchemaTransformer};
+use gliner2::config::{download_model, ModelFiles};
+use gliner2::engine::Gliner2Engine;
+use gliner2::{
+    batch_extract, infer_metadata_from_schema, BatchSchemaMode, ExtractOptions, Extractor,
+    ExtractorConfig, SchemaTransformer,
+};
+#[cfg(feature = "tch")]
+use gliner2::TchExtractor;
+use serde_json::{json, Value};
 use std::fs;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
+
+#[derive(Parser)]
+#[command(name = "gliner2")]
+#[command(version)]
+#[command(about = "Gliner2 CLI", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    /// Hugging Face model id
+    #[arg(long, default_value = "fastino/gliner2-base-v1", global = true)]
+    model: String,
+
+    /// Offline layout directory
+    #[arg(long, global = true)]
+    model_dir: Option<PathBuf>,
+
+    /// Explicit path to config.json
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Explicit path to encoder_config/config.json
+    #[arg(long, global = true)]
+    encoder_config: Option<PathBuf>,
+
+    /// Explicit path to tokenizer.json
+    #[arg(long, global = true)]
+    tokenizer: Option<PathBuf>,
+
+    /// Explicit path to model.safetensors
+    #[arg(long, global = true)]
+    weights: Option<PathBuf>,
+
+    /// Backend (candle or tch)
+    #[arg(long, env = "GLINER2_BACKEND", default_value = "candle", global = true)]
+    backend: String,
+
+    /// Log level (off, error, warn, info, debug, trace)
+    #[arg(long, default_value = "info", global = true)]
+    log_level: String,
+
+    // Inference flags
+    #[arg(long, default_value_t = 0.5, global = true)]
+    threshold: f32,
+
+    #[arg(long, global = true)]
+    max_len: Option<usize>,
+
+    #[arg(long, global = true)]
+    include_confidence: bool,
+
+    #[arg(long, global = true)]
+    include_spans: bool,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    format_results: bool,
+
+    #[arg(long, global = true)]
+    raw: bool,
+
+    #[arg(long, default_value_t = 8, global = true)]
+    batch_size: usize,
+
+    /// Field containing document text in JSON / JSONL records
+    #[arg(long, default_value = "text", global = true)]
+    text_field: String,
+
+    /// Field to pass through as record id when present
+    #[arg(long, default_value = "id", global = true)]
+    id_field: String,
+
+    /// Plain text: full (whole file) or line (one record per non-empty line)
+    #[arg(long, default_value = "full", global = true)]
+    text_split: String,
+
+    /// Output path (default: stdout)
+    #[arg(short, long, global = true)]
+    output: Option<PathBuf>,
+
+    /// Pretty-print JSON (only if output can be buffered)
+    #[arg(long, global = true)]
+    pretty: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Named-entity extraction
+    Entities {
+        /// Repeatable entity type name
+        #[arg(long)]
+        label: Vec<String>,
+        /// JSON array of names or object form (name -> description)
+        #[arg(long)]
+        labels_json: Option<PathBuf>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Text classification
+    Classify {
+        /// Required classification task name
+        #[arg(long)]
+        task: String,
+        /// Repeatable class label
+        #[arg(long)]
+        label: Vec<String>,
+        /// Array of labels or object (label -> description)
+        #[arg(long)]
+        labels_json: Option<PathBuf>,
+        /// Multi-label classification
+        #[arg(long)]
+        multi_label: bool,
+        /// Per-task classifier threshold
+        #[arg(long, default_value_t = 0.5)]
+        cls_threshold: f32,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Relation extraction
+    Relations {
+        /// Repeatable relation type name
+        #[arg(long)]
+        relation: Vec<String>,
+        /// JSON array of names or object form
+        #[arg(long)]
+        relations_json: Option<PathBuf>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Structured JSON / field extraction
+    Json {
+        /// JSON file: object mapping structure name -> array of field specs
+        #[arg(long)]
+        structures: Option<PathBuf>,
+        /// Same object inline
+        #[arg(long)]
+        structures_json: Option<String>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Multitask: full engine schema in one pass
+    Run {
+        /// Full engine multitask schema
+        #[arg(long)]
+        schema_file: PathBuf,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+}
+
+struct Record {
+    id: Option<Value>,
+    text: String,
+}
+
+enum Engine {
+    Candle(Extractor),
+    #[cfg(feature = "tch")]
+    Tch(TchExtractor),
+}
+
+impl Gliner2Engine for Engine {
+    type Tensor = candle_core::Tensor;
+
+    fn hidden_size(&self) -> usize {
+        match self {
+            Engine::Candle(e) => e.hidden_size(),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.hidden_size(),
+        }
+    }
+
+    fn max_width(&self) -> usize {
+        match self {
+            Engine::Candle(e) => e.max_width(),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.max_width(),
+        }
+    }
+
+    fn encode_sequence(
+        &self,
+        input_ids: &Self::Tensor,
+        attention_mask: &Self::Tensor,
+    ) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::encode_sequence(e, input_ids, attention_mask),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.encode_sequence(input_ids, attention_mask),
+        }
+    }
+
+    fn gather_text_word_embeddings(
+        &self,
+        last_hidden: &Self::Tensor,
+        positions: &[usize],
+    ) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::gather_text_word_embeddings(e, last_hidden, positions),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.gather_text_word_embeddings(last_hidden, positions),
+        }
+    }
+
+    fn gather_text_word_embeddings_batch_idx(
+        &self,
+        last_hidden: &Self::Tensor,
+        batch_idx: usize,
+        positions: &[usize],
+    ) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => {
+                Gliner2Engine::gather_text_word_embeddings_batch_idx(e, last_hidden, batch_idx, positions)
+            }
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => {
+                e.gather_text_word_embeddings_batch_idx(last_hidden, batch_idx, positions)
+            }
+        }
+    }
+
+    fn compute_span_rep(&self, text_word_embs: &Self::Tensor) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::compute_span_rep(e, text_word_embs),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.compute_span_rep(text_word_embs),
+        }
+    }
+
+    fn compute_span_rep_batched(
+        &self,
+        token_embs_list: &[Self::Tensor],
+    ) -> Result<Vec<Self::Tensor>> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::compute_span_rep_batched(e, token_embs_list),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.compute_span_rep_batched(token_embs_list),
+        }
+    }
+
+    fn classifier_logits(&self, label_rows: &Self::Tensor) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::classifier_logits(e, label_rows),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.classifier_logits(label_rows),
+        }
+    }
+
+    fn count_predict(&self, p_embedding: &Self::Tensor) -> Result<usize> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::count_predict(e, p_embedding),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.count_predict(p_embedding),
+        }
+    }
+
+    fn span_scores_sigmoid(
+        &self,
+        span_rep: &Self::Tensor,
+        field_embs: &Self::Tensor,
+        pred_count: usize,
+    ) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::span_scores_sigmoid(e, span_rep, field_embs, pred_count),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.span_scores_sigmoid(span_rep, field_embs, pred_count),
+        }
+    }
+
+    fn single_sample_inputs(&self, input_ids: &[u32]) -> Result<(Self::Tensor, Self::Tensor)> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::single_sample_inputs(e, input_ids),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.single_sample_inputs(input_ids),
+        }
+    }
+
+    fn batch_inputs(
+        &self,
+        input_ids: Vec<u32>,
+        attention_mask_i64: Vec<i64>,
+        batch_size: usize,
+        max_seq_len: usize,
+    ) -> Result<(Self::Tensor, Self::Tensor)> {
+        match self {
+            Engine::Candle(e) => {
+                Gliner2Engine::batch_inputs(e, input_ids, attention_mask_i64, batch_size, max_seq_len)
+            }
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.batch_inputs(input_ids, attention_mask_i64, batch_size, max_seq_len),
+        }
+    }
+
+    fn batch_row_hidden(&self, hidden: &Self::Tensor, idx: usize) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::batch_row_hidden(e, hidden, idx),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.batch_row_hidden(hidden, idx),
+        }
+    }
+
+    fn stack_schema_token_embeddings(
+        &self,
+        last_hidden_seq: &Self::Tensor,
+        positions: &[usize],
+    ) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::stack_schema_token_embeddings(e, last_hidden_seq, positions),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.stack_schema_token_embeddings(last_hidden_seq, positions),
+        }
+    }
+
+    fn tensor_dim0(&self, t: &Self::Tensor) -> Result<usize> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::tensor_dim0(e, t),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.tensor_dim0(t),
+        }
+    }
+
+    fn tensor_narrow0(&self, t: &Self::Tensor, start: usize, len: usize) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::tensor_narrow0(e, t, start, len),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.tensor_narrow0(t, start, len),
+        }
+    }
+
+    fn tensor_index0(&self, t: &Self::Tensor, i: usize) -> Result<Self::Tensor> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::tensor_index0(e, t, i),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.tensor_index0(t, i),
+        }
+    }
+
+    fn tensor_logits_1d(&self, logits: &Self::Tensor) -> Result<Vec<f32>> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::tensor_logits_1d(e, logits),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.tensor_logits_1d(logits),
+        }
+    }
+
+    fn tensor_span_scores_to_vec4(&self, t: &Self::Tensor) -> Result<Vec<Vec<Vec<Vec<f32>>>>> {
+        match self {
+            Engine::Candle(e) => Gliner2Engine::tensor_span_scores_to_vec4(e, t),
+            #[cfg(feature = "tch")]
+            Engine::Tch(e) => e.tensor_span_scores_to_vec4(t),
+        }
+    }
+}
+
+fn resolve_model_files(cli: &Cli) -> Result<ModelFiles> {
+    if let Some(dir) = &cli.model_dir {
+        return Ok(ModelFiles {
+            config: dir.join("config.json"),
+            encoder_config: dir.join("encoder_config/config.json"),
+            tokenizer: dir.join("tokenizer.json"),
+            weights: dir.join("model.safetensors"),
+        });
+    }
+
+    if let (Some(c), Some(e), Some(t), Some(w)) = (
+        &cli.config,
+        &cli.encoder_config,
+        &cli.tokenizer,
+        &cli.weights,
+    ) {
+        return Ok(ModelFiles {
+            config: c.clone(),
+            encoder_config: e.clone(),
+            tokenizer: t.clone(),
+            weights: w.clone(),
+        });
+    }
+
+    download_model(&cli.model)
+}
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
 
-    let repo_id = "fastino/gliner2-base-v1";
-    println!("Downloading model from {}...", repo_id);
-    let files = download_model(repo_id)?;
+    let level = match cli.log_level.to_lowercase().as_str() {
+        "off" => tracing::Level::ERROR, // close enough if off isn't avail
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "info" => tracing::Level::INFO,
+        "debug" => tracing::Level::DEBUG,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    };
+    tracing_subscriber::fmt().with_max_level(level).init();
 
-    let device = Device::Cpu; // PoC on CPU
-    let dtype = candle_core::DType::F32;
+    let files = resolve_model_files(&cli)?;
 
-    // 1. Load Configs
     let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
     let mut encoder_config: DebertaConfig =
         serde_json::from_str(&fs::read_to_string(&files.encoder_config)?)?;
 
-    // 2. Load Tokenizer & Processor
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
-
-    // Update vocab_size if needed
     encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
 
-    // 3. Load Weights
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
+    let engine = if cli.backend == "tch" {
+        #[cfg(feature = "tch")]
+        {
+            Engine::Tch(TchExtractor::load_cpu(
+                &files,
+                config,
+                encoder_config,
+                processor.tokenizer.get_vocab_size(true),
+            )?)
+        }
+        #[cfg(not(feature = "tch"))]
+        {
+            anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
+        }
+    } else {
+        let device = Device::Cpu;
+        let dtype = candle_core::DType::F32;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
+        Engine::Candle(Extractor::load(config, encoder_config, vb)?)
+    };
 
-    // 4. Create Extractor
-    let extractor = Extractor::load(config, encoder_config, vb)?;
+    let input_path = match &cli.command {
+        Commands::Entities { input, .. } => input,
+        Commands::Classify { input, .. } => input,
+        Commands::Relations { input, .. } => input,
+        Commands::Json { input, .. } => input,
+        Commands::Run { input, .. } => input,
+    };
 
-    // 5. Inference
-    let text = "Steve Jobs founded Apple in Cupertino.";
-    let entities = vec!["person", "company", "location"];
+    let records = gather_records(input_path, &cli)?;
 
-    println!("Extracting entities from: \"{}\"", text);
-    println!("Target entities: {:?}", entities);
+    if records.is_empty() {
+        return Ok(());
+    }
 
-    let formatted = processor.format_input_for_ner(text, &entities)?;
+    let (schema, meta) = build_schema_and_meta(&cli.command)?;
 
-    let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
-    let attention_mask = Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
+    let opts = ExtractOptions {
+        threshold: cli.threshold,
+        format_results: !cli.raw && cli.format_results,
+        include_confidence: cli.include_confidence,
+        include_spans: cli.include_spans,
+        max_len: cli.max_len,
+        batch_size: cli.batch_size,
+    };
 
-    let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
+    let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+    let results = batch_extract(&engine, &processor, &texts, BatchSchemaMode::Shared {
+        schema: &schema,
+        meta: &meta,
+    }, &opts)?;
 
-    let results = gliner2::decode::find_spans(
-        &scores,
-        0.5,
-        &entities,
-        text,
-        &formatted.start_offsets,
-        &formatted.end_offsets,
-    )?;
+    let mut out_writer: Box<dyn io::Write> = if let Some(path) = &cli.output {
+        Box::new(fs::File::create(path)?)
+    } else {
+        Box::new(io::stdout())
+    };
 
-    println!("\nResults:");
-    for entity in results {
-        println!(
-            "{}: {} ({:.4})",
-            entity.label, entity.text, entity.confidence
-        );
+    if cli.pretty && results.len() == 1 {
+        let r = &results[0];
+        let mut out_obj = serde_json::Map::new();
+        if let Some(id) = &records[0].id {
+            out_obj.insert(cli.id_field.clone(), id.clone());
+        }
+        out_obj.insert(cli.text_field.clone(), json!(records[0].text));
+        out_obj.insert("result".into(), r.clone());
+        serde_json::to_writer_pretty(&mut out_writer, &out_obj)?;
+        writeln!(out_writer)?;
+    } else {
+        for (i, r) in results.into_iter().enumerate() {
+            let mut out_obj = serde_json::Map::new();
+            if let Some(id) = &records[i].id {
+                out_obj.insert(cli.id_field.clone(), id.clone());
+            }
+            out_obj.insert(cli.text_field.clone(), json!(records[i].text));
+            out_obj.insert("result".into(), r);
+            serde_json::to_writer(&mut out_writer, &out_obj)?;
+            writeln!(out_writer)?;
+        }
     }
 
     Ok(())
+}
+
+fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    let (mut reader, path_is_jsonl, path_is_json) = if input == "-" {
+        (Box::new(io::BufReader::new(io::stdin())) as Box<dyn BufRead>, true, false)
+    } else {
+        let path = Path::new(input);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_jsonl = ext == "jsonl";
+        let is_json = ext == "json";
+        let file = fs::File::open(path)?;
+        (Box::new(io::BufReader::new(file)) as Box<dyn BufRead>, is_jsonl, is_json)
+    };
+
+    if path_is_json {
+        let val: Value = serde_json::from_reader(reader)?;
+        if let Some(arr) = val.as_array() {
+            for v in arr {
+                records.push(val_to_record(v, cli)?);
+            }
+        } else {
+            records.push(val_to_record(&val, cli)?);
+        }
+    } else if path_is_jsonl {
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() { continue; }
+            let val: Value = serde_json::from_str(&line)?;
+            records.push(val_to_record(&val, cli)?);
+        }
+    } else {
+        // Plain text
+        if cli.text_split == "line" {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() { continue; }
+                records.push(Record { id: None, text: line });
+            }
+        } else {
+            let mut content = String::new();
+            reader.read_to_string(&mut content)?;
+            records.push(Record { id: None, text: content });
+        }
+    }
+
+    Ok(records)
+}
+
+fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
+    let obj = v.as_object().context("Expected JSON object for record")?;
+    let text = obj.get(&cli.text_field)
+        .and_then(|t| t.as_str())
+        .context(format!("Missing text field {:?} in record", cli.text_field))?
+        .to_string();
+    let id = obj.get(&cli.id_field).cloned();
+    Ok(Record { id, text })
+}
+
+fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::ExtractionMetadata)> {
+    let mut s = gliner2::schema::create_schema();
+    match cmd {
+        Commands::Entities { label, labels_json, .. } => {
+            if !label.is_empty() && labels_json.is_some() {
+                anyhow::bail!("Cannot provide both --label and --labels-json");
+            }
+            if let Some(path) = labels_json {
+                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+                s.entities(v);
+            } else {
+                s.entities(json!(label));
+            }
+        }
+        Commands::Classify { task, label, labels_json, multi_label, cls_threshold, .. } => {
+            if !label.is_empty() && labels_json.is_some() {
+                anyhow::bail!("Cannot provide both --label and --labels-json");
+            }
+            let labels = if let Some(path) = labels_json {
+                serde_json::from_str(&fs::read_to_string(path)?)?
+            } else {
+                json!(label)
+            };
+            s.classification(task, labels, *multi_label, *cls_threshold);
+        }
+        Commands::Relations { relation, relations_json, .. } => {
+            if !relation.is_empty() && relations_json.is_some() {
+                anyhow::bail!("Cannot provide both --relation and --relations-json");
+            }
+            let rels = if let Some(path) = relations_json {
+                serde_json::from_str(&fs::read_to_string(path)?)?
+            } else {
+                json!(relation)
+            };
+            s.relations(rels);
+        }
+        Commands::Json { structures, structures_json, .. } => {
+            if structures.is_some() && structures_json.is_some() {
+                anyhow::bail!("Cannot provide both --structures and --structures-json");
+            }
+            if let Some(path) = structures {
+                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+                let obj = v.as_object().context("--structures must be a JSON object")?;
+                s.extract_json_structures(obj)?;
+            } else if let Some(js) = structures_json {
+                let v: Value = serde_json::from_str(js)?;
+                let obj = v.as_object().context("--structures-json must be a JSON object")?;
+                s.extract_json_structures(obj)?;
+            }
+        }
+        Commands::Run { schema_file, .. } => {
+            let v: Value = serde_json::from_str(&fs::read_to_string(schema_file)?)?;
+            let meta = infer_metadata_from_schema(&v);
+            return Ok((v, meta));
+        }
+    }
+    Ok(s.build())
 }

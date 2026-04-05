@@ -3,12 +3,16 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::debertav2::Config as DebertaConfig;
+#[cfg(feature = "tch-backend")]
+use gliner2::TchExtractor;
 use gliner2::config::download_model;
 use gliner2::decode::{self, Entity};
 use gliner2::{ExtractOptions, Extractor, ExtractorConfig, SchemaTransformer};
 use serde::Serialize;
 use std::fs;
 use std::time::Instant;
+#[cfg(feature = "tch-backend")]
+use tch::Device as TchDevice;
 
 const DEFAULT_MODEL_ID: &str = "fastino/gliner2-base-v1";
 /// Same labels on every sample so Python can use batch_size = N.
@@ -23,6 +27,8 @@ struct Fixture {
 struct ThroughputOutput {
     runner: &'static str,
     model_id: String,
+    /// `candle` (full Candle stack) or `tch` (LibTorch encoder + Candle heads).
+    backend: String,
     device_note: &'static str,
     mode: &'static str,
     /// Encoder batch size for `batch_extract_entities`; 1 means sequential `forward` loop.
@@ -34,13 +40,21 @@ struct ThroughputOutput {
     samples_per_sec: f64,
 }
 
-fn parse_args() -> Result<(String, String, usize, usize, usize)> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Candle,
+    #[cfg(feature = "tch-backend")]
+    Tch,
+}
+
+fn parse_args() -> Result<(String, String, usize, usize, usize, Backend)> {
     let args: Vec<String> = std::env::args().collect();
     let mut fixtures_path: Option<String> = None;
     let mut model_id = DEFAULT_MODEL_ID.to_string();
     let mut samples = 64usize;
     let mut warmup = 2usize;
     let mut rust_batch_size = 1usize;
+    let mut backend = Backend::Candle;
 
     let mut i = 1;
     while i < args.len() {
@@ -77,12 +91,29 @@ fn parse_args() -> Result<(String, String, usize, usize, usize)> {
                     .parse()
                     .context("parse --rust-batch-size")?;
             }
+            "--backend" => {
+                i += 1;
+                let b = args
+                    .get(i)
+                    .context("--backend needs candle or tch")?
+                    .to_ascii_lowercase();
+                match b.as_str() {
+                    "candle" => backend = Backend::Candle,
+                    #[cfg(feature = "tch-backend")]
+                    "tch" => backend = Backend::Tch,
+                    #[cfg(not(feature = "tch-backend"))]
+                    "tch" => anyhow::bail!(
+                        "backend tch requires building harness_compare with --features tch-backend"
+                    ),
+                    other => anyhow::bail!("unknown --backend {other:?}; use candle or tch"),
+                }
+            }
             other if !other.starts_with('-') && fixtures_path.is_none() => {
                 fixtures_path = Some(other.to_string());
             }
             other => {
                 anyhow::bail!(
-                    "unknown arg {other:?}; try: harness_throughput <fixtures.json> [--samples N] [--warmup W] [--model-id ID] [--rust-batch-size B]"
+                    "unknown arg {other:?}; try: harness_throughput <fixtures.json> [--samples N] [--warmup W] [--model-id ID] [--rust-batch-size B] [--backend candle|tch]"
                 )
             }
         }
@@ -90,14 +121,60 @@ fn parse_args() -> Result<(String, String, usize, usize, usize)> {
     }
 
     let fixtures_path = fixtures_path.context(
-        "usage: harness_throughput <fixtures.json> [--samples 64] [--warmup 2] [--model-id ID] [--rust-batch-size B]",
+        "usage: harness_throughput <fixtures.json> [--samples 64] [--warmup 2] [--model-id ID] [--rust-batch-size B] [--backend candle|tch]",
     )?;
 
-    Ok((fixtures_path, model_id, samples, warmup, rust_batch_size))
+    Ok((
+        fixtures_path,
+        model_id,
+        samples,
+        warmup,
+        rust_batch_size,
+        backend,
+    ))
+}
+
+fn backend_str(b: Backend) -> &'static str {
+    match b {
+        Backend::Candle => "candle",
+        #[cfg(feature = "tch-backend")]
+        Backend::Tch => "tch",
+    }
+}
+
+fn device_note(b: Backend) -> &'static str {
+    match b {
+        Backend::Candle => "cpu",
+        #[cfg(feature = "tch-backend")]
+        Backend::Tch => "cpu_libtorch",
+    }
+}
+
+fn time_sequential<F>(
+    warmup_passes: usize,
+    samples: usize,
+    base: &[Fixture],
+    mut run_one: F,
+) -> Result<f64>
+where
+    F: FnMut(&str) -> Result<Vec<Entity>>,
+{
+    for _ in 0..warmup_passes {
+        for i in 0..samples {
+            let text = &base[i % base.len()].text;
+            let _ = run_one(text)?;
+        }
+    }
+    let infer_start = Instant::now();
+    for i in 0..samples {
+        let text = &base[i % base.len()].text;
+        let _ = run_one(text)?;
+    }
+    Ok(infer_start.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn main() -> Result<()> {
-    let (fixtures_path, model_id, samples, warmup_passes, rust_batch_size) = parse_args()?;
+    let (fixtures_path, model_id, samples, warmup_passes, rust_batch_size, backend) = parse_args()?;
 
     let fixtures_json =
         fs::read_to_string(&fixtures_path).with_context(|| format!("read {}", fixtures_path))?;
@@ -118,25 +195,6 @@ fn main() -> Result<()> {
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
     encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
-    let extractor = Extractor::load(config, encoder_config, vb)?;
-    let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
-
-    let run_one = |text: &str| -> Result<Vec<Entity>> {
-        let formatted = processor.format_input_for_ner(text, &labels)?;
-        let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
-        let attention_mask = Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
-        let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
-        Ok(decode::find_spans(
-            &scores,
-            threshold,
-            &labels,
-            text,
-            &formatted.start_offsets,
-            &formatted.end_offsets,
-        )?)
-    };
-
     let labels_owned: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
     let extract_opts = ExtractOptions {
         threshold,
@@ -147,78 +205,191 @@ fn main() -> Result<()> {
         batch_size: rust_batch_size.max(1),
     };
 
-    if rust_batch_size <= 1 {
-        for _ in 0..warmup_passes {
-            for i in 0..samples {
-                let text = &base[i % base.len()].text;
-                let _ = run_one(text)?;
+    match backend {
+        Backend::Candle => {
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
+            let extractor = Extractor::load(config, encoder_config, vb)?;
+            let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+            let run_one = |text: &str| -> Result<Vec<Entity>> {
+                let formatted = processor.format_input_for_ner(text, &labels)?;
+                let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
+                let attention_mask =
+                    Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
+                let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
+                Ok(decode::find_spans(
+                    &scores,
+                    threshold,
+                    &labels,
+                    text,
+                    &formatted.start_offsets,
+                    &formatted.end_offsets,
+                )?)
+            };
+
+            if rust_batch_size <= 1 {
+                let total_infer_ms = time_sequential(warmup_passes, samples, &base, run_one)?;
+                let samples_per_sec = if total_infer_ms > 0.0 {
+                    samples as f64 / (total_infer_ms / 1000.0)
+                } else {
+                    f64::INFINITY
+                };
+                let out = ThroughputOutput {
+                    runner: "rust_throughput",
+                    model_id,
+                    backend: backend_str(backend).to_string(),
+                    device_note: device_note(backend),
+                    mode: "sequential_forward",
+                    batch_size: 1,
+                    samples,
+                    warmup_full_passes: warmup_passes,
+                    load_model_ms,
+                    total_infer_ms,
+                    samples_per_sec,
+                };
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
             }
-        }
 
-        let infer_start = Instant::now();
-        for i in 0..samples {
-            let text = &base[i % base.len()].text;
-            let _ = run_one(text)?;
-        }
-        let total_infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
-        let samples_per_sec = if total_infer_ms > 0.0 {
-            samples as f64 / (total_infer_ms / 1000.0)
-        } else {
-            f64::INFINITY
-        };
+            let text_vec: Vec<String> = (0..samples)
+                .map(|i| base[i % base.len()].text.clone())
+                .collect();
 
-        let out = ThroughputOutput {
-            runner: "rust_throughput",
-            model_id,
-            device_note: "cpu",
-            mode: "sequential_forward",
-            batch_size: 1,
-            samples,
-            warmup_full_passes: warmup_passes,
-            load_model_ms,
-            total_infer_ms,
-            samples_per_sec,
-        };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
+            for _ in 0..warmup_passes {
+                let _ = extractor.batch_extract_entities(
+                    &processor,
+                    &text_vec,
+                    &labels_owned,
+                    &extract_opts,
+                )?;
+            }
+
+            let infer_start = Instant::now();
+            let _ = extractor.batch_extract_entities(
+                &processor,
+                &text_vec,
+                &labels_owned,
+                &extract_opts,
+            )?;
+            let total_infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
+            let samples_per_sec = if total_infer_ms > 0.0 {
+                samples as f64 / (total_infer_ms / 1000.0)
+            } else {
+                f64::INFINITY
+            };
+
+            let out = ThroughputOutput {
+                runner: "rust_throughput",
+                model_id,
+                backend: backend_str(backend).to_string(),
+                device_note: device_note(backend),
+                mode: "batched_extract_entities",
+                batch_size: rust_batch_size.max(1),
+                samples,
+                warmup_full_passes: warmup_passes,
+                load_model_ms,
+                total_infer_ms,
+                samples_per_sec,
+            };
+
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        #[cfg(feature = "tch-backend")]
+        Backend::Tch => {
+            let tch_extractor = TchExtractor::load(
+                &files,
+                config,
+                encoder_config,
+                processor.tokenizer.get_vocab_size(true),
+                TchDevice::Cpu,
+            )?;
+            let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+
+            let run_one = |text: &str| -> Result<Vec<Entity>> {
+                let formatted = processor.format_input_for_ner(text, &labels)?;
+                let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
+                let attention_mask =
+                    Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
+                let scores = tch_extractor.forward(&input_ids, &attention_mask, &formatted)?;
+                Ok(decode::find_spans(
+                    &scores,
+                    threshold,
+                    &labels,
+                    text,
+                    &formatted.start_offsets,
+                    &formatted.end_offsets,
+                )?)
+            };
+
+            if rust_batch_size <= 1 {
+                let total_infer_ms = time_sequential(warmup_passes, samples, &base, run_one)?;
+                let samples_per_sec = if total_infer_ms > 0.0 {
+                    samples as f64 / (total_infer_ms / 1000.0)
+                } else {
+                    f64::INFINITY
+                };
+                let out = ThroughputOutput {
+                    runner: "rust_throughput",
+                    model_id,
+                    backend: backend_str(backend).to_string(),
+                    device_note: device_note(backend),
+                    mode: "sequential_forward",
+                    batch_size: 1,
+                    samples,
+                    warmup_full_passes: warmup_passes,
+                    load_model_ms,
+                    total_infer_ms,
+                    samples_per_sec,
+                };
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+
+            let text_vec: Vec<String> = (0..samples)
+                .map(|i| base[i % base.len()].text.clone())
+                .collect();
+
+            for _ in 0..warmup_passes {
+                let _ = tch_extractor.batch_extract_entities(
+                    &processor,
+                    &text_vec,
+                    &labels_owned,
+                    &extract_opts,
+                )?;
+            }
+
+            let infer_start = Instant::now();
+            let _ = tch_extractor.batch_extract_entities(
+                &processor,
+                &text_vec,
+                &labels_owned,
+                &extract_opts,
+            )?;
+            let total_infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
+            let samples_per_sec = if total_infer_ms > 0.0 {
+                samples as f64 / (total_infer_ms / 1000.0)
+            } else {
+                f64::INFINITY
+            };
+
+            let out = ThroughputOutput {
+                runner: "rust_throughput",
+                model_id,
+                backend: backend_str(backend).to_string(),
+                device_note: device_note(backend),
+                mode: "batched_extract_entities",
+                batch_size: rust_batch_size.max(1),
+                samples,
+                warmup_full_passes: warmup_passes,
+                load_model_ms,
+                total_infer_ms,
+                samples_per_sec,
+            };
+
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
     }
 
-    let text_vec: Vec<String> = (0..samples)
-        .map(|i| base[i % base.len()].text.clone())
-        .collect();
-
-    for _ in 0..warmup_passes {
-        let _ = extractor.batch_extract_entities(
-            &processor,
-            &text_vec,
-            &labels_owned,
-            &extract_opts,
-        )?;
-    }
-
-    let infer_start = Instant::now();
-    let _ =
-        extractor.batch_extract_entities(&processor, &text_vec, &labels_owned, &extract_opts)?;
-    let total_infer_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
-    let samples_per_sec = if total_infer_ms > 0.0 {
-        samples as f64 / (total_infer_ms / 1000.0)
-    } else {
-        f64::INFINITY
-    };
-
-    let out = ThroughputOutput {
-        runner: "rust_throughput",
-        model_id,
-        device_note: "cpu",
-        mode: "batched_extract_entities",
-        batch_size: rust_batch_size.max(1),
-        samples,
-        warmup_full_passes: warmup_passes,
-        load_model_ms,
-        total_infer_ms,
-        samples_per_sec,
-    };
-
-    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }

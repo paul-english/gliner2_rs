@@ -1,6 +1,6 @@
 ---
 id: gli-4hsh
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-05T16:15:02Z

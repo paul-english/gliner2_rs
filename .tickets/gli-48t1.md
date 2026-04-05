@@ -1,6 +1,6 @@
 ---
 id: gli-48t1
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-05T00:15:29Z

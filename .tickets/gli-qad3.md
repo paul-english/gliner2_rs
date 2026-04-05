@@ -1,6 +1,6 @@
 ---
 id: gli-qad3
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-04-05T00:15:12Z
