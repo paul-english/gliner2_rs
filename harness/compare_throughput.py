@@ -195,7 +195,7 @@ def main() -> int:
     rb8_ms = _f(r_b8.get("total_infer_ms"))
     rb8_sps = _f(r_b8.get("samples_per_sec"))
     print(
-        f"{f'Rust batched (bs=8)':30} {rb8_ms:14.3f} {rb8_sps:12.3f}  {r_b8.get('mode', '')}"
+        f"{'Rust batched (bs=8)':30} {rb8_ms:14.3f} {rb8_sps:12.3f}  {r_b8.get('mode', '')}"
     )
     pb8 = _py_batched(py, 8)
     if pb8:
@@ -203,14 +203,14 @@ def main() -> int:
         p_sps = _f(pb8.get("samples_per_sec"))
         ratio = p_ms / rb8_ms if rb8_ms > 0 else float("inf")
         print(
-            f"{f'Python batched (bs=8)':30} {p_ms:14.3f} {p_sps:12.3f}  "
+            f"{'Python batched (bs=8)':30} {p_ms:14.3f} {p_sps:12.3f}  "
             f"python/rust {ratio:.3f}x"
         )
 
     rb64_ms = _f(r_b64.get("total_infer_ms"))
     rb64_sps = _f(r_b64.get("samples_per_sec"))
     print(
-        f"{f'Rust batched (bs=64)':30} {rb64_ms:14.3f} {rb64_sps:12.3f}  {r_b64.get('mode', '')}"
+        f"{'Rust batched (bs=64)':30} {rb64_ms:14.3f} {rb64_sps:12.3f}  {r_b64.get('mode', '')}"
     )
     pb64 = _py_batched(py, 64)
     if pb64:
@@ -218,7 +218,7 @@ def main() -> int:
         p_sps = _f(pb64.get("samples_per_sec"))
         ratio = p_ms / rb64_ms if rb64_ms > 0 else float("inf")
         print(
-            f"{f'Python batched (bs=64)':30} {p_ms:14.3f} {p_sps:12.3f}  "
+            f"{'Python batched (bs=64)':30} {p_ms:14.3f} {p_sps:12.3f}  "
             f"python/rust {ratio:.3f}x"
         )
 

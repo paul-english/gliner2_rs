@@ -64,7 +64,6 @@ def render_entity_summary(
     rust_tch: dict[str, Any] | None,
 ) -> str:
     r_cases = rust.get("cases", [])
-    p_cases = {c["id"]: c for c in py.get("cases", [])}
     r_total = _ms_line(r_cases)
     p_total = _ms_line(py.get("cases", []))
 
@@ -133,9 +132,7 @@ def render_entity_cases(
 ) -> str:
     r_cases = {c["id"]: c for c in rust.get("cases", [])}
     p_cases = {c["id"]: c for c in py.get("cases", [])}
-    t_cases = (
-        {c["id"]: c for c in rust_tch.get("cases", [])} if rust_tch else None
-    )
+    t_cases = {c["id"]: c for c in rust_tch.get("cases", [])} if rust_tch else None
     ids = sorted(set(r_cases) | set(p_cases))
 
     lines = [
@@ -167,9 +164,7 @@ def render_entity_cases(
 
 
 def render_entity_footnote() -> str:
-    return (
-        "† Expected device label for tch-rs harness JSON when LibTorch is used (`run_compare_all.sh` enables this by default; otherwise set `GLINER2_BENCH_TCH=1`)."
-    )
+    return "† Expected device label for tch-rs harness JSON when LibTorch is used (`run_compare_all.sh` enables this by default; otherwise set `GLINER2_BENCH_TCH=1`)."
 
 
 def render_multitask_summary(
@@ -197,8 +192,7 @@ def render_multitask_summary(
         tt = t_total if t_total is not None else 0.0
         sr, st, sp = _bold_if_min_ms([r_total, tt, p_total])
         row_load = (
-            f"| `load_model_ms`      | {br}         | "
-            f"{bt}          | {bp}           |"
+            f"| `load_model_ms`      | {br}         | {bt}          | {bp}           |"
         )
         row_sum = (
             f"| Sum of `infer_ms`    | {sr}         | "
@@ -342,13 +336,9 @@ def render_throughput_loads(
     if r_seq_t is not None:
         t_ms = _f(r_seq_t.get("load_model_ms"))
         bc, bt, bp = _bold_if_min_ms([c_ms, t_ms, py_ms], ndigits=0)
-        return (
-            f"Load times: Candle ~{bc} ms; tch ~{bt} ms; Python ~{bp} ms."
-        )
+        return f"Load times: Candle ~{bc} ms; tch ~{bt} ms; Python ~{bp} ms."
     bc, bp = _bold_if_min_ms([c_ms, py_ms], ndigits=0)
-    return (
-        f"Load times: Candle ~{bc} ms (seq/b8/b64 runs may differ slightly); Python ~{bp} ms."
-    )
+    return f"Load times: Candle ~{bc} ms (seq/b8/b64 runs may differ slightly); Python ~{bp} ms."
 
 
 def optional_tch(path: Path) -> dict[str, Any] | None:
@@ -413,12 +403,8 @@ def render_all_fragments(
         r_b64 = _load(artifact_dir / "throughput_rust_batch_64_candle.json")
         tp_py = _load(artifact_dir / "throughput_python.json")
         # run_throughput.sh names tch files: <candle_path_stem>_tch.json
-        r_seq_t = optional_tch(
-            artifact_dir / "throughput_rust_seq_candle_tch.json"
-        )
-        r_b8_t = optional_tch(
-            artifact_dir / "throughput_rust_batch_8_candle_tch.json"
-        )
+        r_seq_t = optional_tch(artifact_dir / "throughput_rust_seq_candle_tch.json")
+        r_b8_t = optional_tch(artifact_dir / "throughput_rust_batch_8_candle_tch.json")
         r_b64_t = optional_tch(
             artifact_dir / "throughput_rust_batch_64_candle_tch.json"
         )

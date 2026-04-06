@@ -17,7 +17,11 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from readme_tables import render_all_fragments, resolve_artifact_dir, tch_json_for
+from readme_tables import (  # noqa: E402
+    render_all_fragments,
+    resolve_artifact_dir,
+    tch_json_for,
+)
 
 # Must exist in README when patching from a full artifact dir (entity + multitask).
 REQUIRED_MARKERS = frozenset(
