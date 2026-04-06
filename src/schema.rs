@@ -54,11 +54,7 @@ impl RegexValidator {
                 .is_some_and(|m| m.start() == 0 && m.end() == text.len()),
             RegexMatchMode::Partial => self.re.is_match(text),
         };
-        if self.exclude {
-            !matched
-        } else {
-            matched
-        }
+        if self.exclude { !matched } else { matched }
     }
 }
 

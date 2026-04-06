@@ -144,7 +144,10 @@ impl CandleExtractor {
 
         let text_len = text_word_embs.dim(0)?;
         let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
-        let span_flat: Vec<Vec<u32>> = indices.iter().map(|[s, e]| vec![*s as u32, *e as u32]).collect();
+        let span_flat: Vec<Vec<u32>> = indices
+            .iter()
+            .map(|[s, e]| vec![*s as u32, *e as u32])
+            .collect();
         let span_indices = Tensor::new(span_flat, device)?.reshape((1, (), 2))?; // [1, S, 2]
 
         let span_rep = self
@@ -229,7 +232,10 @@ impl CandleExtractor {
         let device = text_word_embs.device();
         let text_len = text_word_embs.dim(0)?;
         let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
-        let span_flat: Vec<Vec<u32>> = indices.iter().map(|[s, e]| vec![*s as u32, *e as u32]).collect();
+        let span_flat: Vec<Vec<u32>> = indices
+            .iter()
+            .map(|[s, e]| vec![*s as u32, *e as u32])
+            .collect();
         let span_indices = Tensor::new(span_flat, device)?.reshape((1, (), 2))?;
         let span_rep = self
             .span_rep

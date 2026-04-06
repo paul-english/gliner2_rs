@@ -264,8 +264,7 @@ pub fn batch_extract<E: Gliner2Engine>(
                             (&schemas[global], &metas[global])
                         }
                     };
-                    let pre =
-                        transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
+                    let pre = transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
                     Ok((pre, meta))
                 })
                 .collect();
@@ -1029,9 +1028,7 @@ fn extract_structures_inner(
                 );
                 if let Some(vm) = fmeta {
                     if !vm.validators.is_empty() {
-                        spans.retain(|(t, _, _, _)| {
-                            vm.validators.iter().all(|v| v.validate(t))
-                        });
+                        spans.retain(|(t, _, _, _)| vm.validators.iter().all(|v| v.validate(t)));
                     }
                 }
                 let formatted = format_spans(&spans, include_confidence, include_spans);

@@ -545,7 +545,10 @@ impl TchHeads {
 
         let text_len = text_word_embs.size()[0] as usize;
         let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
-        let span_data: Vec<i64> = indices.iter().flat_map(|[s, e]| [*s as i64, *e as i64]).collect();
+        let span_data: Vec<i64> = indices
+            .iter()
+            .flat_map(|[s, e]| [*s as i64, *e as i64])
+            .collect();
         let dev = last_hidden_state.device();
         let span_idx = Tensor::from_slice(&span_data)
             .to_device(dev)
@@ -585,7 +588,10 @@ impl TchHeads {
         let text_len = text_word_embs.size()[0] as usize;
         let dev = text_word_embs.device();
         let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
-        let span_data: Vec<i64> = indices.iter().flat_map(|[s, e]| [*s as i64, *e as i64]).collect();
+        let span_data: Vec<i64> = indices
+            .iter()
+            .flat_map(|[s, e]| [*s as i64, *e as i64])
+            .collect();
         let span_idx = Tensor::from_slice(&span_data)
             .to_device(dev)
             .to_kind(Kind::Int64)
