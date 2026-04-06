@@ -1,6 +1,6 @@
 ---
 id: gli-cbpt
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-05T14:26:29Z

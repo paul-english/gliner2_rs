@@ -994,7 +994,7 @@ fn extract_structures_inner(
             } else {
                 let scores_2d =
                     slice_scores_pk(span_scores, inst, fidx, slice_l, l_words, text_len);
-                let spans = find_spans_from_grid(
+                let mut spans = find_spans_from_grid(
                     &scores_2d,
                     text_len,
                     field_threshold,
@@ -1002,6 +1002,13 @@ fn extract_structures_inner(
                     start_map,
                     end_map,
                 );
+                if let Some(vm) = fmeta {
+                    if !vm.validators.is_empty() {
+                        spans.retain(|(t, _, _, _)| {
+                            vm.validators.iter().all(|v| v.validate(t))
+                        });
+                    }
+                }
                 let formatted = format_spans(&spans, include_confidence, include_spans);
                 if dtype_list {
                     let arr: Vec<Value> = formatted

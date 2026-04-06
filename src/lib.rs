@@ -21,6 +21,6 @@ pub use extract::{
 pub use preprocess::{PreprocessedBatch, PreprocessedInput, TaskType, collate_preprocessed};
 pub use processor::SchemaTransformer;
 pub use schema::{
-    ExtractionMetadata, ParsedFieldSpec, Schema, StructureBuilder, ValueDtype, create_schema,
-    infer_metadata_from_schema, parse_field_spec,
+    ExtractionMetadata, ParsedFieldSpec, RegexMatchMode, RegexValidator, Schema, StructureBuilder,
+    ValueDtype, create_schema, infer_metadata_from_schema, parse_field_spec,
 };

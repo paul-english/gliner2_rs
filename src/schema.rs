@@ -1,9 +1,66 @@
 //! Python-aligned `Schema` builder and extraction metadata (`gliner2.inference.engine.Schema`).
 
 use anyhow::{Context, Result as AnyResult};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+
+/// Match mode for [`RegexValidator`] (Python `RegexValidator.mode`: `"full"` | `"partial"`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegexMatchMode {
+    /// `re.fullmatch` — entire span text must match.
+    #[default]
+    Full,
+    /// `re.search` — pattern may match a substring.
+    Partial,
+}
+
+/// Regex-based span filter for post-processing (Python `RegexValidator`).
+#[derive(Clone, Debug)]
+pub struct RegexValidator {
+    re: Regex,
+    mode: RegexMatchMode,
+    exclude: bool,
+}
+
+impl RegexValidator {
+    /// Build a validator. `case_insensitive` matches Python default `re.IGNORECASE`.
+    pub fn new(
+        pattern: impl AsRef<str>,
+        mode: RegexMatchMode,
+        exclude: bool,
+        case_insensitive: bool,
+    ) -> AnyResult<Self> {
+        let re = regex::RegexBuilder::new(pattern.as_ref())
+            .case_insensitive(case_insensitive)
+            .build()
+            .with_context(|| format!("Invalid regex: {:?}", pattern.as_ref()))?;
+        Ok(Self { re, mode, exclude })
+    }
+
+    /// Python defaults: `mode=full`, `exclude=false`, `flags=re.IGNORECASE`.
+    pub fn with_defaults(pattern: impl AsRef<str>) -> AnyResult<Self> {
+        Self::new(pattern, RegexMatchMode::Full, false, true)
+    }
+
+    /// Returns whether the span text passes this validator (Python `validate`).
+    pub fn validate(&self, text: &str) -> bool {
+        let matched = match self.mode {
+            RegexMatchMode::Full => self
+                .re
+                .find(text)
+                .is_some_and(|m| m.start() == 0 && m.end() == text.len()),
+            RegexMatchMode::Partial => self.re.is_match(text),
+        };
+        if self.exclude {
+            !matched
+        } else {
+            matched
+        }
+    }
+}
 
 /// Field typing for structure / entity metadata (mirrors Python `dtype`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,12 +72,45 @@ pub enum ValueDtype {
 }
 
 /// Parsed `extract_json` field spec (string `name::dtype::[choices]::description` or JSON object).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ParsedFieldSpec {
     pub name: String,
     pub dtype: ValueDtype,
     pub choices: Option<Vec<String>>,
     pub description: Option<String>,
+    pub validators: Vec<RegexValidator>,
+}
+
+fn parse_validator_specs(arr: &[Value]) -> Vec<RegexValidator> {
+    let mut out = Vec::new();
+    for v in arr {
+        let Some(o) = v.as_object() else {
+            continue;
+        };
+        let Some(pattern) = o.get("pattern").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if pattern.is_empty() {
+            continue;
+        }
+        let mode = o
+            .get("mode")
+            .and_then(|x| x.as_str())
+            .map(|s| match s {
+                "partial" => RegexMatchMode::Partial,
+                _ => RegexMatchMode::Full,
+            })
+            .unwrap_or(RegexMatchMode::Full);
+        let exclude = o.get("exclude").and_then(|x| x.as_bool()).unwrap_or(false);
+        let case_insensitive = o
+            .get("case_insensitive")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        if let Ok(val) = RegexValidator::new(pattern, mode, exclude, case_insensitive) {
+            out.push(val);
+        }
+    }
+    out
 }
 
 /// Parse a field spec string or object (Python `GLiNER2._parse_field_spec`).
@@ -47,11 +137,17 @@ pub fn parse_field_spec(spec: &Value) -> AnyResult<ParsedFieldSpec> {
             .get("description")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let validators = o
+            .get("validators")
+            .and_then(|v| v.as_array())
+            .map(|a| parse_validator_specs(a))
+            .unwrap_or_default();
         return Ok(ParsedFieldSpec {
             name,
             dtype,
             choices,
             description,
+            validators,
         });
     }
 
@@ -82,6 +178,7 @@ fn parse_field_spec_str(spec: &str) -> AnyResult<ParsedFieldSpec> {
             dtype,
             choices,
             description: desc,
+            validators: Vec::new(),
         });
     }
 
@@ -112,6 +209,7 @@ fn parse_field_spec_str(spec: &str) -> AnyResult<ParsedFieldSpec> {
         dtype,
         choices,
         description: desc,
+        validators: Vec::new(),
     })
 }
 
@@ -120,6 +218,9 @@ pub struct FieldMeta {
     pub dtype: ValueDtype,
     pub threshold: Option<f32>,
     pub choices: Option<Vec<String>>,
+    /// Post-extraction span filters (not serialized in JSON schema dict; used in [`ExtractionMetadata`] only).
+    #[serde(skip)]
+    pub validators: Vec<RegexValidator>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -238,7 +339,14 @@ impl Schema {
                 let p = parse_field_spec(spec).with_context(|| {
                     format!("extract_json_structures: invalid field spec under {parent:?}")
                 })?;
-                builder.field(p.name, p.dtype, p.choices, p.description, None);
+                builder.field(
+                    p.name,
+                    p.dtype,
+                    p.choices,
+                    p.description,
+                    None,
+                    Some(p.validators).filter(|v| !v.is_empty()),
+                );
             }
         }
         Ok(())
@@ -450,11 +558,11 @@ impl Drop for StructureBuilder<'_> {
 
 impl<'a> StructureBuilder<'a> {
     pub fn field_str(&mut self, name: impl Into<String>) -> &mut Self {
-        self.field(name, ValueDtype::Str, None, None, None)
+        self.field(name, ValueDtype::Str, None, None, None, None)
     }
 
     pub fn field_list(&mut self, name: impl Into<String>) -> &mut Self {
-        self.field(name, ValueDtype::List, None, None, None)
+        self.field(name, ValueDtype::List, None, None, None, None)
     }
 
     pub fn field_choices(
@@ -463,7 +571,7 @@ impl<'a> StructureBuilder<'a> {
         choices: Vec<String>,
         dtype: ValueDtype,
     ) -> &mut Self {
-        self.field(name, dtype, Some(choices), None, None)
+        self.field(name, dtype, Some(choices), None, None, None)
     }
 
     pub fn field(
@@ -473,6 +581,7 @@ impl<'a> StructureBuilder<'a> {
         choices: Option<Vec<String>>,
         description: Option<String>,
         threshold: Option<f32>,
+        validators: Option<Vec<RegexValidator>>,
     ) -> &mut Self {
         let name = name.into();
         let st = self.schema.active_structure.as_mut().expect("structure");
@@ -492,6 +601,7 @@ impl<'a> StructureBuilder<'a> {
                 dtype,
                 threshold,
                 choices,
+                validators: validators.unwrap_or_default(),
             },
         );
         self
@@ -610,12 +720,19 @@ pub fn infer_metadata_from_schema(schema: &Value) -> ExtractionMetadata {
                                     .filter_map(|v| v.as_str().map(String::from))
                                     .collect::<Vec<_>>()
                             });
+                            let validators = fval
+                                .as_object()
+                                .and_then(|o| o.get("validators"))
+                                .and_then(|v| v.as_array())
+                                .map(|a| parse_validator_specs(a))
+                                .unwrap_or_default();
                             meta.field_metadata.insert(
                                 key.clone(),
                                 FieldMeta {
                                     dtype,
                                     threshold,
                                     choices,
+                                    validators,
                                 },
                             );
                         }
@@ -730,5 +847,91 @@ mod tests {
         assert!(fields.contains_key("name"));
         assert!(fields["availability"].get("choices").is_some());
         assert!(meta.field_orders.contains_key("product_info"));
+    }
+
+    #[test]
+    fn regex_validator_full_partial_exclude() {
+        let v = RegexValidator::new(r"^\d{3}$", RegexMatchMode::Full, false, false).unwrap();
+        assert!(v.validate("123"));
+        assert!(!v.validate("1234"));
+        assert!(!v.validate("a12"));
+
+        // Partial uses `search` — unanchored pattern finds digits inside a longer string.
+        let partial = RegexValidator::new(r"\d{3}", RegexMatchMode::Partial, false, false).unwrap();
+        assert!(partial.validate("x123y"));
+
+        let ex = RegexValidator::new(r"^test", RegexMatchMode::Partial, true, false).unwrap();
+        assert!(!ex.validate("tester"));
+        assert!(ex.validate("hello"));
+    }
+
+    #[test]
+    fn regex_validator_default_case_insensitive() {
+        let v = RegexValidator::with_defaults(r"^[A-Z]+$").unwrap();
+        assert!(v.validate("abc"));
+    }
+
+    #[test]
+    fn structure_builder_field_validators_in_metadata() {
+        let email = RegexValidator::with_defaults(r"^[\w.-]+@[\w.-]+\.\w+$").unwrap();
+        let mut s = Schema::new();
+        {
+            let mut b = s.structure("contact");
+            b.field(
+                "email",
+                ValueDtype::Str,
+                None,
+                None,
+                None,
+                Some(vec![email]),
+            );
+        }
+        let (_v, meta) = s.build();
+        let fm = meta
+            .field_metadata
+            .get("contact.email")
+            .expect("contact.email");
+        assert_eq!(fm.validators.len(), 1);
+        assert!(fm.validators[0].validate("a@b.co"));
+        assert!(!fm.validators[0].validate("not-an-email"));
+    }
+
+    #[test]
+    fn infer_metadata_parses_validators() {
+        let v = json!({
+            "entities": {},
+            "classifications": [],
+            "json_structures": [{
+                "form": {
+                    "code": {
+                        "dtype": "str",
+                        "validators": [
+                            { "pattern": r"^\d{3}$", "mode": "full", "exclude": false, "case_insensitive": true }
+                        ]
+                    }
+                }
+            }],
+            "relations": []
+        });
+        let m = infer_metadata_from_schema(&v);
+        let fm = m.field_metadata.get("form.code").expect("form.code");
+        assert_eq!(fm.validators.len(), 1);
+        assert!(fm.validators[0].validate("042"));
+        assert!(!fm.validators[0].validate("42"));
+    }
+
+    #[test]
+    fn parse_field_spec_with_validators() {
+        let p = parse_field_spec(&json!({
+            "name": "email",
+            "dtype": "str",
+            "validators": [
+                { "pattern": "@", "mode": "partial" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(p.name, "email");
+        assert_eq!(p.validators.len(), 1);
+        assert!(p.validators[0].validate("a@b"));
     }
 }
