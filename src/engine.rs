@@ -3,8 +3,11 @@
 use anyhow::Result;
 
 /// Inference backend for the GLiNER2 extract pipeline (encoder + heads + tensor helpers).
-pub trait Gliner2Engine {
-    type Tensor;
+///
+/// `Send + Sync` is required so that `&Engine` can be shared across Rayon worker
+/// threads for parallel preprocessing and per-record decoding.
+pub trait Gliner2Engine: Send + Sync {
+    type Tensor: Send;
 
     /// Cheap copy for backends where [`Clone`] is unavailable (e.g. `tch::Tensor` uses `shallow_clone`).
     fn dup_tensor(&self, t: &Self::Tensor) -> Self::Tensor;

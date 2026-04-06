@@ -24,6 +24,12 @@ pub struct TchExtractor {
     device_tch: TchDevice,
 }
 
+// SAFETY: TchExtractor is used exclusively for read-only inference after model load.
+// tch::Tensor is Send; LibTorch's C++ runtime is thread-safe for concurrent forward passes.
+// VarStore is held only for lifetime management; weights are never mutated after load.
+unsafe impl Send for TchExtractor {}
+unsafe impl Sync for TchExtractor {}
+
 impl TchExtractor {
     pub fn load(
         files: &ModelFiles,

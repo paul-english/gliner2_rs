@@ -17,6 +17,13 @@ pub struct CandleExtractor {
     max_width: usize,
 }
 
+// SAFETY: CandleExtractor is used exclusively for read-only inference after model load.
+// `Sequential` stores `Box<dyn Module>` without Send+Sync bounds, but all concrete Module
+// impls (Linear, Activation) are composed of candle Tensors (Arc-based, inherently thread-safe).
+// No mutation occurs after construction.
+unsafe impl Send for CandleExtractor {}
+unsafe impl Sync for CandleExtractor {}
+
 impl CandleExtractor {
     pub fn load_cpu(
         files: &ModelFiles,
@@ -136,14 +143,9 @@ impl CandleExtractor {
         let schema_special_embs = Tensor::stack(&schema_special_embs, 0)?; // [NumSpecial, D]
 
         let text_len = text_word_embs.dim(0)?;
-        let mut span_indices = Vec::new();
-        for i in 0..text_len {
-            for w in 0..self.max_width {
-                let end = (i + w).min(text_len - 1);
-                span_indices.push(vec![i as u32, end as u32]);
-            }
-        }
-        let span_indices = Tensor::new(span_indices, device)?.reshape((1, (), 2))?; // [1, S, 2]
+        let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
+        let span_flat: Vec<Vec<u32>> = indices.iter().map(|[s, e]| vec![*s as u32, *e as u32]).collect();
+        let span_indices = Tensor::new(span_flat, device)?.reshape((1, (), 2))?; // [1, S, 2]
 
         let span_rep = self
             .span_rep
@@ -226,14 +228,9 @@ impl CandleExtractor {
     pub fn compute_span_rep(&self, text_word_embs: &Tensor) -> Result<Tensor> {
         let device = text_word_embs.device();
         let text_len = text_word_embs.dim(0)?;
-        let mut span_indices = Vec::new();
-        for i in 0..text_len {
-            for w in 0..self.max_width {
-                let end = (i + w).min(text_len - 1);
-                span_indices.push(vec![i as u32, end as u32]);
-            }
-        }
-        let span_indices = Tensor::new(span_indices, device)?.reshape((1, (), 2))?;
+        let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
+        let span_flat: Vec<Vec<u32>> = indices.iter().map(|[s, e]| vec![*s as u32, *e as u32]).collect();
+        let span_indices = Tensor::new(span_flat, device)?.reshape((1, (), 2))?;
         let span_rep = self
             .span_rep
             .forward(&text_word_embs.unsqueeze(0)?, &span_indices)?;
@@ -278,21 +275,15 @@ impl CandleExtractor {
         }
         let padded_t = Tensor::from_vec(padded, (batch_size, max_text_len, hidden), device)?;
 
-        let mut safe_flat = vec![0u32; batch_size * n_spans * 2];
-        for (b, &tl) in text_lengths.iter().enumerate().take(batch_size) {
-            for i in 0..max_text_len {
-                for w in 0..max_width {
-                    let idx = i * max_width + w;
-                    let flat_base = (b * n_spans + idx) * 2;
-                    let end = i + w;
-                    let valid = end < tl;
-                    if valid {
-                        safe_flat[flat_base] = i as u32;
-                        safe_flat[flat_base + 1] = end as u32;
-                    }
-                }
-            }
-        }
+        let batched_indices = crate::span_utils::generate_batched_span_indices(
+            &text_lengths,
+            max_text_len,
+            max_width,
+        );
+        let safe_flat: Vec<u32> = batched_indices
+            .iter()
+            .flat_map(|[s, e]| [*s as u32, *e as u32])
+            .collect();
         let safe_spans = Tensor::from_vec(safe_flat, (batch_size, n_spans, 2), device)?;
         let span_rep = self.span_rep.forward(&padded_t, &safe_spans)?;
 

@@ -40,6 +40,7 @@ tch = { version = "0.23", optional = true }
 safetensors = { version = "0.4", optional = true }
 half = { version = "2", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
+rayon = "1"
 
 [features]
 default = ["candle"]

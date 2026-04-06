@@ -96,6 +96,28 @@ impl TchSpanMarkerV0 {
     }
 }
 
+/// 2-layer MLP: Linear → ReLU → Linear (indices 0, 2). Matches classifier / count_pred.
+pub struct TchMlp2 {
+    pub l0: LinearW,
+    pub l1: LinearW,
+}
+
+impl TchMlp2 {
+    pub fn from_map(map: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            l0: LinearW::from_map(map, &format!("{prefix}.0"))?,
+            l1: LinearW::from_map(map, &format!("{prefix}.2"))?,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        let x = self.l0.forward(x).relu();
+        self.l1.forward(&x)
+    }
+}
+
+/// 3-layer MLP: Linear → ReLU → Linear → ReLU → Linear (indices 0, 2, 4).
+/// Used by CountLstm projector and DownscaledTransformer out_projector.
 pub struct TchMlp3 {
     pub l0: LinearW,
     pub l1: LinearW,
@@ -467,8 +489,8 @@ pub struct TchHeads {
     pub hidden_size: usize,
     pub max_width: usize,
     span_rep: TchSpanMarkerV0,
-    classifier: TchMlp3,
-    count_pred: TchMlp3,
+    classifier: TchMlp2,
+    count_pred: TchMlp2,
     count_embed: TchCountEmbed,
 }
 
@@ -486,8 +508,8 @@ impl TchHeads {
         };
         let max_width = cfg.max_width;
         let span_rep = TchSpanMarkerV0::load(map, max_width, "span_rep.span_rep_layer")?;
-        let classifier = TchMlp3::from_map(map, "classifier")?;
-        let count_pred = TchMlp3::from_map(map, "count_pred")?;
+        let classifier = TchMlp2::from_map(map, "classifier")?;
+        let count_pred = TchMlp2::from_map(map, "count_pred")?;
         let count_embed = TchCountEmbed::load(map, &cfg.counting_layer, hidden, "count_embed")?;
         Ok(Self {
             hidden_size: hidden,
@@ -522,14 +544,8 @@ impl TchHeads {
         let schema_special_embs = Tensor::cat(&sp, 0);
 
         let text_len = text_word_embs.size()[0] as usize;
-        let mut span_data = Vec::with_capacity(text_len * self.max_width * 2);
-        for i in 0..text_len {
-            for w in 0..self.max_width {
-                let end = (i + w).min(text_len - 1);
-                span_data.push(i as i64);
-                span_data.push(end as i64);
-            }
-        }
+        let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
+        let span_data: Vec<i64> = indices.iter().flat_map(|[s, e]| [*s as i64, *e as i64]).collect();
         let dev = last_hidden_state.device();
         let span_idx = Tensor::from_slice(&span_data)
             .to_device(dev)
@@ -568,14 +584,8 @@ impl TchHeads {
     pub fn compute_span_rep(&self, text_word_embs: &Tensor) -> Tensor {
         let text_len = text_word_embs.size()[0] as usize;
         let dev = text_word_embs.device();
-        let mut span_data = Vec::with_capacity(text_len * self.max_width * 2);
-        for i in 0..text_len {
-            for w in 0..self.max_width {
-                let end = (i + w).min(text_len - 1);
-                span_data.push(i as i64);
-                span_data.push(end as i64);
-            }
-        }
+        let indices = crate::span_utils::generate_span_indices(text_len, self.max_width);
+        let span_data: Vec<i64> = indices.iter().flat_map(|[s, e]| [*s as i64, *e as i64]).collect();
         let span_idx = Tensor::from_slice(&span_data)
             .to_device(dev)
             .to_kind(Kind::Int64)
@@ -627,22 +637,15 @@ impl TchHeads {
             hidden,
         ]);
 
-        let mut safe_flat = vec![0i64; (batch_size * n_spans * 2) as usize];
-        for (b, &tl_us) in text_lengths.iter().enumerate() {
-            let b = b as i64;
-            let tl = tl_us as i64;
-            for i in 0..max_text_len {
-                for w in 0..max_w {
-                    let idx = i * max_w + w;
-                    let flat_base = ((b * n_spans + idx) * 2) as usize;
-                    let end = i + w;
-                    if end < tl {
-                        safe_flat[flat_base] = i;
-                        safe_flat[flat_base + 1] = end;
-                    }
-                }
-            }
-        }
+        let batched_indices = crate::span_utils::generate_batched_span_indices(
+            &text_lengths,
+            max_text_len as usize,
+            self.max_width,
+        );
+        let safe_flat: Vec<i64> = batched_indices
+            .iter()
+            .flat_map(|[s, e]| [*s as i64, *e as i64])
+            .collect();
         let safe_spans = Tensor::from_slice(&safe_flat)
             .to_device(device)
             .to_kind(Kind::Int64)

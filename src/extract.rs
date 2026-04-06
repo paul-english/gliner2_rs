@@ -222,6 +222,8 @@ pub fn batch_extract<E: Gliner2Engine>(
     mode: BatchSchemaMode<'_>,
     opts: &ExtractOptions,
 ) -> Result<Vec<Value>> {
+    use rayon::prelude::*;
+
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -249,19 +251,34 @@ pub fn batch_extract<E: Gliner2Engine>(
     let mut base = 0usize;
 
     for chunk in texts.chunks(bs) {
+        // -- Parallel preprocess: tokenize + schema transform per record --
+        let pre_results: Vec<Result<(crate::preprocess::PreprocessedInput, &ExtractionMetadata)>> =
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(j, text)| {
+                    let global = base + j;
+                    let (schema, meta) = match mode {
+                        BatchSchemaMode::Shared { schema, meta } => (schema, meta),
+                        BatchSchemaMode::PerSample { schemas, metas } => {
+                            (&schemas[global], &metas[global])
+                        }
+                    };
+                    let pre =
+                        transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
+                    Ok((pre, meta))
+                })
+                .collect();
+
         let mut pres = Vec::with_capacity(chunk.len());
         let mut metas_chunk: Vec<&ExtractionMetadata> = Vec::with_capacity(chunk.len());
-        for (j, text) in chunk.iter().enumerate() {
-            let global = base + j;
-            let (schema, meta) = match mode {
-                BatchSchemaMode::Shared { schema, meta } => (schema, meta),
-                BatchSchemaMode::PerSample { schemas, metas } => (&schemas[global], &metas[global]),
-            };
-            let pre = transformer.transform_extract(text.as_str(), schema, opts.max_len)?;
+        for r in pre_results {
+            let (pre, meta) = r?;
             pres.push(pre);
             metas_chunk.push(meta);
         }
 
+        // -- Batched tensor forward (sequential, single encoder pass) --
         let batch = collate_preprocessed(&pres).expect("non-empty chunk");
         let mask_i64: Vec<i64> = batch.attention_mask.iter().map(|&x| x as i64).collect();
         let (input_ids, attention_mask) = engine.batch_inputs(
@@ -273,6 +290,7 @@ pub fn batch_extract<E: Gliner2Engine>(
 
         let hidden = engine.encode_sequence(&input_ids, &attention_mask)?;
 
+        // -- Gather per-sample embeddings + batched span rep (sequential) --
         let mut span_emb_list: Vec<E::Tensor> = Vec::new();
         let mut span_orig_index: Vec<usize> = Vec::new();
         for (i, pre) in batch.samples.iter().enumerate() {
@@ -299,21 +317,28 @@ pub fn batch_extract<E: Gliner2Engine>(
             span_by_sample[orig_i] = Some(engine.dup_tensor(&batched_spans[k]));
         }
 
-        for i in 0..batch.batch_size {
-            let pre = &batch.samples[i];
-            let last_h = engine.batch_row_hidden(&hidden, i)?;
-            let meta = metas_chunk[i];
-            let span_ref: Option<&E::Tensor> = if sample_needs_span_rep(pre) {
-                Some(
-                    span_by_sample[i]
-                        .as_ref()
-                        .context("internal: missing batched span rep")?,
-                )
-            } else {
-                None
-            };
-            let v = extract_from_preprocessed(engine, pre, &last_h, span_ref, meta, opts)?;
-            all_out.push(v);
+        // -- Phase A: gather per-sample tensor data (sequential, indexes batched hidden) --
+        let sample_data: Vec<(usize, E::Tensor, Option<E::Tensor>)> = (0..batch.batch_size)
+            .map(|i| {
+                let last_h = engine.batch_row_hidden(&hidden, i)?;
+                let span = span_by_sample[i].take();
+                Ok((i, last_h, span))
+            })
+            .collect::<Result<_>>()?;
+
+        // -- Phase B: parallel per-record decode (into_par_iter: each thread owns its tensors) --
+        let samples = &batch.samples;
+        let decoded: Vec<Result<Value>> = sample_data
+            .into_par_iter()
+            .map(|(i, last_h, span)| {
+                let pre = &samples[i];
+                let meta = metas_chunk[i];
+                extract_from_preprocessed(engine, pre, &last_h, span.as_ref(), meta, opts)
+            })
+            .collect();
+
+        for v in decoded {
+            all_out.push(v?);
         }
 
         base += chunk.len();

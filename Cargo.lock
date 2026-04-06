@@ -1162,6 +1162,7 @@ dependencies = [
  "clap",
  "half",
  "hf-hub",
+ "rayon",
  "regex",
  "safetensors 0.4.5",
  "serde",

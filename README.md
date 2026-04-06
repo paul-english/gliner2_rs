@@ -95,14 +95,22 @@ Rust JSON includes a `backend` field (`candle` or `tch`). For LibTorch encoder t
 
 **Recorded:** 2026-04-05 (Linux x86_64, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=2` over all samples before each timed pass. [harness/compare_throughput.py](harness/compare_throughput.py) prints Candle vs tch vs Python (ratios: `py/cnd`, `tch/cnd`, `py/tch`).
 
-
-| Lane                        | Candle `total_infer_ms` (64) | tch-rs `total_infer_ms` (64) | Python `total_infer_ms` (64) | Candle samples/s | py/candle infer |
-| --------------------------- | ---------------------------- | ---------------------------- | ---------------------------- | ---------------- | --------------- |
-| Sequential (`batch_size` 1) | 11287.2                      | 6828.3                       | 7581.7                       | 5.67             | **0.67×**       |
-| Batched (`batch_size` 64)   | 9377.5                       | 2953.5                       | 2404.9                       | 6.82             | **0.26×**       |
+Batched Rust runs use Rayon for parallel preprocessing and per-record decode. The encoder forward pass is a single batched tensor op; parallelism applies to the CPU-bound work around it.
 
 
-Load times from that run: Rust Candle sequential ~425 ms, batched ~458 ms; Rust tch sequential ~1759 ms, batched ~1779 ms; Python ~3048 ms.
+| Lane                           | Candle `infer_ms` | Candle s/s | tch-rs `infer_ms` | tch-rs s/s | Python `infer_ms` | Python s/s | py/candle | py/tch  |
+| ------------------------------ | ----------------- | ---------- | ----------------- | ---------- | ----------------- | ---------- | --------- | ------- |
+| Sequential (`batch_size` 1)    | 6877              | 9.31       | 3453              | 18.53      | 3799              | 16.85      | **0.55×** | 1.10×   |
+| Batched (`batch_size` 8)       | 6006              | 10.66      | 1389              | **46.08**  | 1573              | 40.68      | **0.26×** | 1.13×   |
+| Batched (`batch_size` 64)      | 5820              | 11.00      | 1267              | **50.50**  | 1304              | 49.08      | **0.22×** | 1.03×   |
+
+
+Load times: Candle ~436 ms; tch ~1660 ms; Python ~2503 ms.
+
+**Notes:**
+- **tch-rs** is consistently faster than Python (~3–13% at batch_size 8–64). Both use LibTorch; tch-rs avoids Python interpreter overhead.
+- **Candle** is ~4–5× slower than Python on batched workloads (py/candle 0.22–0.26×). Candle's pure-Rust GEMM is the bottleneck. Rayon parallelism gives ~2× within Candle (with `RAYON_NUM_THREADS=1`, batched drops to 5.27 s/s).
+- `py/candle` and `py/tch` are time ratios: `(Python infer_ms) / (Rust infer_ms)`. Values **below 1** mean Python was faster; **above 1** mean Rust was faster.
 
 Re-run `bash harness/run_throughput.sh` for Candle-only Rust, or `GLINER2_BENCH_TCH=1 bash harness/run_throughput.sh` to refresh all three lanes (bundled LibTorch via `download-libtorch`).
 
@@ -310,7 +318,7 @@ let out = extractor.extract(&transformer, text, &schema_val, &meta, &opts)?;
 
 ### Batch inference
 
-The crate mirrors Python’s batched entry points: records are preprocessed, **padded into chunks** of at most `ExtractOptions::batch_size` (default **8**), the encoder runs **once per chunk**, span representations are computed with `**compute_span_rep_batched`** when needed, then each row is decoded. Results are returned in **input order**.
+The crate mirrors Python’s batched entry points: records are preprocessed **in parallel** (Rayon), **padded into chunks** of at most `ExtractOptions::batch_size` (default **8**), the encoder runs **once per chunk**, span representations are computed with `**compute_span_rep_batched`** when needed, then each row is **decoded in parallel** (Rayon). Results are returned in **input order**. Set `RAYON_NUM_THREADS` to control the thread pool size.
 
 Set `batch_size` on `ExtractOptions` for any batch method (it only affects chunking, not single-sample `extract_`* calls).
 
