@@ -1,6 +1,5 @@
 //! Multi-task extraction and `format_results` aligned with `gliner2.inference.engine`.
 
-use crate::Extractor;
 use crate::engine::Gliner2Engine;
 use crate::preprocess::{PreprocessedInput, TaskType, collate_preprocessed};
 use crate::processor::SchemaTransformer;
@@ -16,7 +15,7 @@ pub struct ExtractOptions {
     pub include_confidence: bool,
     pub include_spans: bool,
     pub max_len: Option<usize>,
-    /// Chunk size for [`Extractor::batch_extract`] and related batch APIs (Python default: 8).
+    /// Chunk size for batch extraction APIs (Python default: 8).
     pub batch_size: usize,
 }
 
@@ -297,7 +296,7 @@ pub fn batch_extract<E: Gliner2Engine>(
         let mut span_by_sample: Vec<Option<E::Tensor>> =
             (0..batch.batch_size).map(|_| None).collect();
         for (k, &orig_i) in span_orig_index.iter().enumerate() {
-            span_by_sample[orig_i] = Some(batched_spans[k].clone());
+            span_by_sample[orig_i] = Some(engine.dup_tensor(&batched_spans[k]));
         }
 
         for i in 0..batch.batch_size {
@@ -1211,169 +1210,179 @@ fn format_struct_value(v: &Value, include_confidence: bool) -> Value {
     }
 }
 
-impl Extractor {
-    /// High-level API matching Python `Extractor.extract` / `GLiNER2.extract`.
-    pub fn extract(
-        &self,
-        transformer: &SchemaTransformer,
-        text: &str,
-        schema: &Value,
-        meta: &ExtractionMetadata,
-        opts: &ExtractOptions,
-    ) -> Result<Value> {
-        extract_with_schema(self, transformer, text, schema, meta, opts)
-    }
+macro_rules! impl_gliner2_api {
+    ($t:ty) => {
+        impl $t {
+            /// High-level API matching Python `Extractor.extract` / `GLiNER2.extract`.
+            pub fn extract(
+                &self,
+                transformer: &SchemaTransformer,
+                text: &str,
+                schema: &Value,
+                meta: &ExtractionMetadata,
+                opts: &ExtractOptions,
+            ) -> Result<Value> {
+                extract_with_schema(self, transformer, text, schema, meta, opts)
+            }
 
-    /// [`batch_extract`] with a single shared schema (Python `batch_extract` with one schema dict).
-    pub fn batch_extract(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        schema: &Value,
-        meta: &ExtractionMetadata,
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        batch_extract(
-            self,
-            transformer,
-            texts,
-            BatchSchemaMode::Shared { schema, meta },
-            opts,
-        )
-    }
+            /// [`batch_extract`] with a single shared schema (Python `batch_extract` with one schema dict).
+            pub fn batch_extract(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                schema: &Value,
+                meta: &ExtractionMetadata,
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                batch_extract(
+                    self,
+                    transformer,
+                    texts,
+                    BatchSchemaMode::Shared { schema, meta },
+                    opts,
+                )
+            }
 
-    /// [`batch_extract`] with per-text schemas and metadata.
-    pub fn batch_extract_per_sample(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        schemas: &[Value],
-        metas: &[ExtractionMetadata],
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        batch_extract(
-            self,
-            transformer,
-            texts,
-            BatchSchemaMode::PerSample { schemas, metas },
-            opts,
-        )
-    }
+            /// [`batch_extract`] with per-text schemas and metadata.
+            pub fn batch_extract_per_sample(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                schemas: &[Value],
+                metas: &[ExtractionMetadata],
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                batch_extract(
+                    self,
+                    transformer,
+                    texts,
+                    BatchSchemaMode::PerSample { schemas, metas },
+                    opts,
+                )
+            }
 
-    pub fn batch_extract_entities(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        entity_types: &[String],
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        let mut s = crate::schema::Schema::new();
-        let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
-        s.entities(Value::Array(types));
-        let (schema_val, meta) = s.build();
-        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
-    }
+            pub fn batch_extract_entities(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                entity_types: &[String],
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                let mut s = crate::schema::Schema::new();
+                let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
+                s.entities(Value::Array(types));
+                let (schema_val, meta) = s.build();
+                self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+            }
 
-    pub fn batch_classify_text(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        task: &str,
-        labels: Value,
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        let mut s = crate::schema::Schema::new();
-        s.classification_simple(task, labels);
-        let (schema_val, meta) = s.build();
-        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
-    }
+            pub fn batch_classify_text(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                task: &str,
+                labels: Value,
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                let mut s = crate::schema::Schema::new();
+                s.classification_simple(task, labels);
+                let (schema_val, meta) = s.build();
+                self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+            }
 
-    pub fn batch_extract_relations(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        relation_types: Value,
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        let mut s = crate::schema::Schema::new();
-        s.relations(relation_types);
-        let (schema_val, meta) = s.build();
-        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
-    }
+            pub fn batch_extract_relations(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                relation_types: Value,
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                let mut s = crate::schema::Schema::new();
+                s.relations(relation_types);
+                let (schema_val, meta) = s.build();
+                self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+            }
 
-    pub fn batch_extract_json(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        structures: &Value,
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        let obj = structures.as_object().context(
-            "batch_extract_json: structures must be a JSON object (parent → field spec array)",
-        )?;
-        let mut s = crate::schema::Schema::new();
-        s.extract_json_structures(obj)?;
-        let (schema_val, meta) = s.build();
-        self.batch_extract(transformer, texts, &schema_val, &meta, opts)
-    }
+            pub fn batch_extract_json(
+                &self,
+                transformer: &SchemaTransformer,
+                texts: &[String],
+                structures: &Value,
+                opts: &ExtractOptions,
+            ) -> Result<Vec<Value>> {
+                let obj = structures.as_object().context(
+                    "batch_extract_json: structures must be a JSON object (parent → field spec array)",
+                )?;
+                let mut s = crate::schema::Schema::new();
+                s.extract_json_structures(obj)?;
+                let (schema_val, meta) = s.build();
+                self.batch_extract(transformer, texts, &schema_val, &meta, opts)
+            }
 
-    pub fn extract_entities(
-        &self,
-        transformer: &SchemaTransformer,
-        text: &str,
-        entity_types: &[String],
-        opts: &ExtractOptions,
-    ) -> Result<Value> {
-        let mut s = crate::schema::Schema::new();
-        let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
-        s.entities(Value::Array(types));
-        let (schema_val, meta) = s.build();
-        self.extract(transformer, text, &schema_val, &meta, opts)
-    }
+            pub fn extract_entities(
+                &self,
+                transformer: &SchemaTransformer,
+                text: &str,
+                entity_types: &[String],
+                opts: &ExtractOptions,
+            ) -> Result<Value> {
+                let mut s = crate::schema::Schema::new();
+                let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
+                s.entities(Value::Array(types));
+                let (schema_val, meta) = s.build();
+                self.extract(transformer, text, &schema_val, &meta, opts)
+            }
 
-    pub fn classify_text(
-        &self,
-        transformer: &SchemaTransformer,
-        text: &str,
-        task: &str,
-        labels: Value,
-        opts: &ExtractOptions,
-    ) -> Result<Value> {
-        let mut s = crate::schema::Schema::new();
-        s.classification_simple(task, labels);
-        let (schema_val, meta) = s.build();
-        self.extract(transformer, text, &schema_val, &meta, opts)
-    }
+            pub fn classify_text(
+                &self,
+                transformer: &SchemaTransformer,
+                text: &str,
+                task: &str,
+                labels: Value,
+                opts: &ExtractOptions,
+            ) -> Result<Value> {
+                let mut s = crate::schema::Schema::new();
+                s.classification_simple(task, labels);
+                let (schema_val, meta) = s.build();
+                self.extract(transformer, text, &schema_val, &meta, opts)
+            }
 
-    pub fn extract_relations(
-        &self,
-        transformer: &SchemaTransformer,
-        text: &str,
-        relation_types: Value,
-        opts: &ExtractOptions,
-    ) -> Result<Value> {
-        let mut s = crate::schema::Schema::new();
-        s.relations(relation_types);
-        let (schema_val, meta) = s.build();
-        self.extract(transformer, text, &schema_val, &meta, opts)
-    }
+            pub fn extract_relations(
+                &self,
+                transformer: &SchemaTransformer,
+                text: &str,
+                relation_types: Value,
+                opts: &ExtractOptions,
+            ) -> Result<Value> {
+                let mut s = crate::schema::Schema::new();
+                s.relations(relation_types);
+                let (schema_val, meta) = s.build();
+                self.extract(transformer, text, &schema_val, &meta, opts)
+            }
 
-    /// Structured extraction using string or object field specs (Python `GLiNER2.extract_json`).
-    ///
-    /// `structures` must be a JSON object: parent name → array of specs (`"name::dtype::[a|b]::desc"` or object).
-    pub fn extract_json(
-        &self,
-        transformer: &SchemaTransformer,
-        text: &str,
-        structures: &Value,
-        opts: &ExtractOptions,
-    ) -> Result<Value> {
-        let obj = structures.as_object().context(
-            "extract_json: structures must be a JSON object (parent → field spec array)",
-        )?;
-        let mut s = crate::schema::Schema::new();
-        s.extract_json_structures(obj)?;
-        let (schema_val, meta) = s.build();
-        self.extract(transformer, text, &schema_val, &meta, opts)
-    }
+            /// Structured extraction using string or object field specs (Python `GLiNER2.extract_json`).
+            ///
+            /// `structures` must be a JSON object: parent name → array of specs (`"name::dtype::[a|b]::desc"` or object).
+            pub fn extract_json(
+                &self,
+                transformer: &SchemaTransformer,
+                text: &str,
+                structures: &Value,
+                opts: &ExtractOptions,
+            ) -> Result<Value> {
+                let obj = structures.as_object().context(
+                    "extract_json: structures must be a JSON object (parent → field spec array)",
+                )?;
+                let mut s = crate::schema::Schema::new();
+                s.extract_json_structures(obj)?;
+                let (schema_val, meta) = s.build();
+                self.extract(transformer, text, &schema_val, &meta, opts)
+            }
+        }
+    };
 }
+
+#[cfg(feature = "candle")]
+impl_gliner2_api!(crate::CandleExtractor);
+
+#[cfg(feature = "tch")]
+impl_gliner2_api!(crate::TchExtractor);

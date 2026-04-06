@@ -1,61 +1,43 @@
-//! tch-rs + rust-bert DeBERTa encoder with Candle heads (shared [`crate::model::Extractor`] weights for span/count/classifier).
+//! LibTorch DeBERTa encoder (`rust-bert`) + GLiNER heads on `tch::Tensor` (no Candle).
 //!
-//! Encoder forward runs in LibTorch via [`rust_bert::deberta_v2::DebertaV2Model`]; activations are copied to Candle tensors for the existing head pipeline, giving numerical parity with the pure-Candle path without reimplementing GLiNER heads in tch.
+//! Weights load from the same `model.safetensors` as the Candle backend: encoder keys into
+//! `nn::VarStore`, head tensors via [`weights::load_safetensors`].
 
-mod loader;
+mod heads;
+mod weights;
 
 use crate::config::{ExtractorConfig, ModelFiles};
 use crate::engine::Gliner2Engine;
-use crate::extract::{BatchSchemaMode, ExtractOptions};
-use crate::model::Extractor;
-use crate::processor::{FormattedInput, SchemaTransformer};
-use crate::schema::Schema;
+use crate::processor::FormattedInput;
 use anyhow::{Context, Result};
-use candle_core::{Result as CResult, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as CandleDebertaConfig;
+use heads::TchHeads;
 use rust_bert::deberta_v2::{DebertaV2Config, DebertaV2Model};
-use serde_json::{Value, json};
 use std::path::Path;
-use tch::{Device as TchDevice, nn};
+use tch::{Device as TchDevice, Kind, Tensor, nn};
 
-fn candle_err(e: candle_core::Error) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
-}
-
-/// GLiNER2 inference with a LibTorch DeBERTa encoder and Candle span/count heads.
 pub struct TchExtractor {
-    /// Keeps LibTorch encoder weights alive for `deberta`.
     #[allow(dead_code)]
     vs: nn::VarStore,
     deberta: DebertaV2Model,
-    candle: Extractor,
+    heads: TchHeads,
     device_tch: TchDevice,
 }
 
 impl TchExtractor {
-    /// Load from the same file layout as [`Extractor::load`] (mmap Candle heads + tch encoder from `model.safetensors`).
     pub fn load(
         files: &ModelFiles,
         extract_config: ExtractorConfig,
-        mut encoder_config: CandleDebertaConfig,
         processor_vocab_size: usize,
         device_tch: TchDevice,
     ) -> Result<Self> {
-        let dtype = candle_core::DType::F32;
-        let cdev = candle_core::Device::Cpu;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[files.weights.clone()], dtype, &cdev)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        };
-        encoder_config.vocab_size = processor_vocab_size;
-        let candle = Extractor::load(extract_config, encoder_config, vb)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let tm = weights::load_safetensors(&files.weights, device_tch)?;
+        let heads = TchHeads::load(&tm.tensors, device_tch, &extract_config)?;
 
         let enc_json = std::fs::read_to_string(&files.encoder_config)
             .with_context(|| format!("read {}", files.encoder_config.display()))?;
-        let rb_cfg: DebertaV2Config =
+        let mut rb_cfg: DebertaV2Config =
             serde_json::from_str(&enc_json).context("parse encoder_config as DebertaV2Config")?;
+        rb_cfg.vocab_size = processor_vocab_size as i64;
 
         let mut vs = nn::VarStore::new(device_tch);
         let deberta = DebertaV2Model::new(&vs.root().sub("encoder"), &rb_cfg);
@@ -65,50 +47,39 @@ impl TchExtractor {
         Ok(Self {
             vs,
             deberta,
-            candle,
+            heads,
             device_tch,
         })
     }
 
-    /// Convenience: CPU LibTorch device.
     pub fn load_cpu(
         files: &ModelFiles,
         extract_config: ExtractorConfig,
-        encoder_config: CandleDebertaConfig,
         processor_vocab_size: usize,
     ) -> Result<Self> {
         Self::load(
             files,
             extract_config,
-            encoder_config,
             processor_vocab_size,
             TchDevice::Cpu,
         )
     }
 
-    /// Load using `encoder_config.json` path (for tests / callers without [`ModelFiles`]).
     pub fn load_from_paths(
         weights: &Path,
         encoder_config_path: &Path,
         extract_config: ExtractorConfig,
-        mut encoder_config: CandleDebertaConfig,
         processor_vocab_size: usize,
         device_tch: TchDevice,
     ) -> Result<Self> {
-        let dtype = candle_core::DType::F32;
-        let cdev = candle_core::Device::Cpu;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights.to_path_buf()], dtype, &cdev)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        };
-        encoder_config.vocab_size = processor_vocab_size;
-        let candle = Extractor::load(extract_config, encoder_config, vb)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let tm = weights::load_safetensors(weights, device_tch)?;
+        let heads = TchHeads::load(&tm.tensors, device_tch, &extract_config)?;
 
         let enc_json = std::fs::read_to_string(encoder_config_path)
             .with_context(|| format!("read {}", encoder_config_path.display()))?;
-        let rb_cfg: DebertaV2Config =
+        let mut rb_cfg: DebertaV2Config =
             serde_json::from_str(&enc_json).context("parse encoder_config")?;
+        rb_cfg.vocab_size = processor_vocab_size as i64;
 
         let mut vs = nn::VarStore::new(device_tch);
         let deberta = DebertaV2Model::new(&vs.root().sub("encoder"), &rb_cfg);
@@ -118,80 +89,61 @@ impl TchExtractor {
         Ok(Self {
             vs,
             deberta,
-            candle,
+            heads,
             device_tch,
         })
     }
 
-    /// Same NER PoC path as [`Extractor::forward`], but encoder runs in LibTorch.
+    /// NER-style forward: encoder + heads → `[num_entities, L, max_width]` scores.
     pub fn forward(
         &self,
         input_ids: &Tensor,
         attention_mask: &Tensor,
         formatted: &FormattedInput,
-    ) -> CResult<Tensor> {
-        let enc = self
-            .encode_tch_to_candle(input_ids, attention_mask)
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        self.candle.forward_from_encoder_output(&enc, formatted)
+    ) -> Result<Tensor> {
+        let enc =
+            tch::no_grad(|| self.encode_sequence_internal(input_ids, attention_mask))?;
+        Ok(self.heads.forward_from_encoder_output(
+            &enc,
+            &formatted.text_word_first_positions,
+            &formatted.schema_special_positions,
+        ))
     }
 
-    /// [`crate::batch_extract_entities`] equivalent for the tch encoder backend.
-    pub fn batch_extract_entities(
-        &self,
-        transformer: &SchemaTransformer,
-        texts: &[String],
-        entity_types: &[String],
-        opts: &ExtractOptions,
-    ) -> Result<Vec<Value>> {
-        let mut s = Schema::new();
-        let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
-        s.entities(Value::Array(types));
-        let (schema_val, meta) = s.build();
-        crate::batch_extract(
-            self,
-            transformer,
-            texts,
-            BatchSchemaMode::Shared {
-                schema: &schema_val,
-                meta: &meta,
-            },
-            opts,
-        )
-    }
-
-    fn encode_tch_to_candle(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let ids_tch = loader::candle_2d_int_to_tch(input_ids, self.device_tch)?;
-        let mask_tch = loader::candle_2d_int_to_tch(attention_mask, self.device_tch)?;
-        let token_type = tch::Tensor::zeros_like(&ids_tch);
-        let out = tch::no_grad(|| {
-            self.deberta.forward_t(
-                Some(&ids_tch),
-                Some(&mask_tch),
+    fn encode_sequence_internal(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let token_type = Tensor::zeros_like(input_ids);
+        let out = self
+            .deberta
+            .forward_t(
+                Some(input_ids),
+                Some(attention_mask),
                 Some(&token_type),
                 None,
                 None,
                 false,
             )
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        loader::tch_hidden_to_candle(&out.hidden_state)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(out.hidden_state)
     }
 }
 
 impl Gliner2Engine for TchExtractor {
     type Tensor = Tensor;
 
+    fn dup_tensor(&self, t: &Self::Tensor) -> Self::Tensor {
+        t.shallow_clone()
+    }
+
     fn hidden_size(&self) -> usize {
-        self.candle.hidden_size()
+        self.heads.hidden_size
     }
 
     fn max_width(&self) -> usize {
-        self.candle.max_width()
+        self.heads.max_width
     }
 
     fn encode_sequence(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        self.encode_tch_to_candle(input_ids, attention_mask)
+        tch::no_grad(|| self.encode_sequence_internal(input_ids, attention_mask))
     }
 
     fn gather_text_word_embeddings(
@@ -199,9 +151,8 @@ impl Gliner2Engine for TchExtractor {
         last_hidden: &Tensor,
         positions: &[usize],
     ) -> Result<Tensor> {
-        self.candle
-            .gather_text_word_embeddings(last_hidden, positions)
-            .map_err(candle_err)
+        let row = last_hidden.select(0, 0);
+        Ok(gather_row_positions(&row, positions))
     }
 
     fn gather_text_word_embeddings_batch_idx(
@@ -210,31 +161,24 @@ impl Gliner2Engine for TchExtractor {
         batch_idx: usize,
         positions: &[usize],
     ) -> Result<Tensor> {
-        self.candle
-            .gather_text_word_embeddings_batch_idx(last_hidden, batch_idx, positions)
-            .map_err(candle_err)
+        let row = last_hidden.select(0, batch_idx as i64);
+        Ok(gather_row_positions(&row, positions))
     }
 
     fn compute_span_rep(&self, text_word_embs: &Tensor) -> Result<Tensor> {
-        self.candle
-            .compute_span_rep(text_word_embs)
-            .map_err(candle_err)
+        Ok(self.heads.compute_span_rep(text_word_embs))
     }
 
     fn compute_span_rep_batched(&self, token_embs_list: &[Tensor]) -> Result<Vec<Tensor>> {
-        self.candle
-            .compute_span_rep_batched(token_embs_list)
-            .map_err(candle_err)
+        Ok(self.heads.compute_span_rep_batched(token_embs_list))
     }
 
     fn classifier_logits(&self, label_rows: &Tensor) -> Result<Tensor> {
-        self.candle
-            .classifier_logits(label_rows)
-            .map_err(candle_err)
+        Ok(self.heads.classifier_logits(label_rows))
     }
 
     fn count_predict(&self, p_embedding: &Tensor) -> Result<usize> {
-        self.candle.count_predict(p_embedding).map_err(candle_err)
+        Ok(self.heads.count_predict(p_embedding))
     }
 
     fn span_scores_sigmoid(
@@ -243,13 +187,19 @@ impl Gliner2Engine for TchExtractor {
         field_embs: &Tensor,
         pred_count: usize,
     ) -> Result<Tensor> {
-        self.candle
-            .span_scores_sigmoid(span_rep, field_embs, pred_count)
-            .map_err(candle_err)
+        Ok(self
+            .heads
+            .span_scores_sigmoid(span_rep, field_embs, pred_count))
     }
 
     fn single_sample_inputs(&self, input_ids: &[u32]) -> Result<(Tensor, Tensor)> {
-        Gliner2Engine::single_sample_inputs(&self.candle, input_ids)
+        let dev = self.device_tch;
+        let v: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
+        let t = Tensor::from_slice(&v)
+            .to_device(dev)
+            .unsqueeze(0);
+        let mask = Tensor::ones(t.size().as_slice(), (Kind::Int64, dev));
+        Ok((t, mask))
     }
 
     fn batch_inputs(
@@ -259,17 +209,19 @@ impl Gliner2Engine for TchExtractor {
         batch_size: usize,
         max_seq_len: usize,
     ) -> Result<(Tensor, Tensor)> {
-        Gliner2Engine::batch_inputs(
-            &self.candle,
-            input_ids,
-            attention_mask_i64,
-            batch_size,
-            max_seq_len,
-        )
+        let dev = self.device_tch;
+        let v: Vec<i64> = input_ids.into_iter().map(|x| x as i64).collect();
+        let ids = Tensor::from_slice(&v)
+            .to_device(dev)
+            .reshape(&[batch_size as i64, max_seq_len as i64]);
+        let mask = Tensor::from_slice(&attention_mask_i64)
+            .to_device(dev)
+            .reshape(&[batch_size as i64, max_seq_len as i64]);
+        Ok((ids, mask))
     }
 
     fn batch_row_hidden(&self, hidden: &Tensor, idx: usize) -> Result<Tensor> {
-        Gliner2Engine::batch_row_hidden(&self.candle, hidden, idx)
+        Ok(hidden.select(0, idx as i64))
     }
 
     fn stack_schema_token_embeddings(
@@ -277,26 +229,64 @@ impl Gliner2Engine for TchExtractor {
         last_hidden_seq: &Tensor,
         positions: &[usize],
     ) -> Result<Tensor> {
-        Gliner2Engine::stack_schema_token_embeddings(&self.candle, last_hidden_seq, positions)
+        let mut rows = Vec::new();
+        for &p in positions {
+            rows.push(last_hidden_seq.select(0, p as i64).unsqueeze(0));
+        }
+        Ok(Tensor::cat(&rows, 0))
     }
 
     fn tensor_dim0(&self, t: &Tensor) -> Result<usize> {
-        Gliner2Engine::tensor_dim0(&self.candle, t)
+        Ok(t.size()[0] as usize)
     }
 
     fn tensor_narrow0(&self, t: &Tensor, start: usize, len: usize) -> Result<Tensor> {
-        Gliner2Engine::tensor_narrow0(&self.candle, t, start, len)
+        Ok(t.narrow(0, start as i64, len as i64))
     }
 
     fn tensor_index0(&self, t: &Tensor, i: usize) -> Result<Tensor> {
-        Gliner2Engine::tensor_index0(&self.candle, t, i)
+        Ok(t.select(0, i as i64))
     }
 
     fn tensor_logits_1d(&self, logits: &Tensor) -> Result<Vec<f32>> {
-        Gliner2Engine::tensor_logits_1d(&self.candle, logits)
+        let n = logits.numel();
+        let mut v = vec![0f32; n];
+        logits.copy_data(&mut v, n);
+        Ok(v)
     }
 
     fn tensor_span_scores_to_vec4(&self, t: &Tensor) -> Result<Vec<Vec<Vec<Vec<f32>>>>> {
-        Gliner2Engine::tensor_span_scores_to_vec4(&self.candle, t)
+        let sz = t.size();
+        if sz.len() != 4 {
+            anyhow::bail!("expected 4D tensor");
+        }
+        let b = sz[0] as usize;
+        let p = sz[1] as usize;
+        let l = sz[2] as usize;
+        let k = sz[3] as usize;
+        let n = b * p * l * k;
+        let mut flat = vec![0f32; n];
+        t.copy_data(&mut flat, n);
+        let mut out = vec![vec![vec![vec![0f32; k]; l]; p]; b];
+        let mut idx = 0usize;
+        for bi in 0..b {
+            for pi in 0..p {
+                for li in 0..l {
+                    for ki in 0..k {
+                        out[bi][pi][li][ki] = flat[idx];
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
+}
+
+fn gather_row_positions(row: &Tensor, positions: &[usize]) -> Tensor {
+    let mut v = Vec::new();
+    for &p in positions {
+        v.push(row.select(0, p as i64).unsqueeze(0));
+    }
+    Tensor::cat(&v, 0)
 }

@@ -1,12 +1,9 @@
 //! Batch vs sequential extraction parity (downloads model on first run).
-use candle_core::Device;
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as DebertaConfig;
 use gliner2::config::download_model;
 use gliner2::schema::infer_metadata_from_schema;
 use gliner2::{
-    BatchSchemaMode, ExtractOptions, Extractor, ExtractorConfig, SchemaTransformer, batch_extract,
-    extract_with_schema,
+    BatchSchemaMode, CandleExtractor, ExtractOptions, ExtractorConfig, SchemaTransformer,
+    batch_extract, extract_with_schema,
 };
 use serde_json::{Value, json};
 
@@ -17,19 +14,13 @@ fn batch_extract_matches_sequential_shared_schema() {
         .unwrap_or_else(|_| "fastino/gliner2-base-v1".to_string());
 
     let files = download_model(&model_id).expect("download_model");
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
 
     let config: ExtractorConfig =
         serde_json::from_str(&std::fs::read_to_string(&files.config).unwrap()).unwrap();
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&std::fs::read_to_string(&files.encoder_config).unwrap()).unwrap();
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap()).unwrap();
-    encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
+    let vocab = processor.tokenizer.get_vocab_size(true);
 
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
-    let extractor = Extractor::load(config, encoder_config, vb).unwrap();
+    let extractor = CandleExtractor::load_cpu(&files, config, vocab).unwrap();
 
     let schema = json!({
         "entities": { "person": "", "company": "" }
@@ -77,19 +68,13 @@ fn batch_extract_matches_sequential_per_sample_schema() {
         .unwrap_or_else(|_| "fastino/gliner2-base-v1".to_string());
 
     let files = download_model(&model_id).expect("download_model");
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
 
     let config: ExtractorConfig =
         serde_json::from_str(&std::fs::read_to_string(&files.config).unwrap()).unwrap();
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&std::fs::read_to_string(&files.encoder_config).unwrap()).unwrap();
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap()).unwrap();
-    encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
+    let vocab = processor.tokenizer.get_vocab_size(true);
 
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device).unwrap() };
-    let extractor = Extractor::load(config, encoder_config, vb).unwrap();
+    let extractor = CandleExtractor::load_cpu(&files, config, vocab).unwrap();
 
     let s0 = json!({ "entities": { "person": "", "company": "" } });
     let s1 = json!({ "entities": { "location": "" } });

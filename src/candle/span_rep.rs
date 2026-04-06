@@ -1,4 +1,4 @@
-use crate::layers::create_projection_layer;
+use super::layers::create_projection_layer;
 use candle_core::{D, Result, Tensor};
 use candle_nn::{Activation, Module, Sequential, VarBuilder};
 

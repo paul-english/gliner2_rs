@@ -1,3 +1,4 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,25 +12,41 @@ pub struct Entity {
 
 /// Decodes span scores into entities. Greedy overlap suppression runs **per label** (same as
 /// GliNER2 `_extract_entities`); results are concatenated in `labels` order.
+///
+/// `scores_flat` is row-major `[num_entities * l * max_width]` matching `scores[p][i][j]` =
+/// `scores_flat[p * (l * max_width) + i * max_width + j]`.
 pub fn find_spans(
-    scores: &candle_core::Tensor,
+    scores_flat: &[f32],
+    num_entities: usize,
+    l: usize,
+    max_width: usize,
     threshold: f32,
     labels: &[&str],
     text: &str,
     start_offsets: &[usize],
     end_offsets: &[usize],
-) -> candle_core::Result<Vec<Entity>> {
-    // scores: [NumEntities, L, max_width]
-    let (num_entities, l, max_width) = scores.dims3()?;
-    let scores_v = scores.to_vec3::<f32>()?;
+) -> Result<Vec<Entity>> {
+    let expected = num_entities * l * max_width;
+    if scores_flat.len() != expected {
+        bail!(
+            "find_spans: expected {} scores ({} * {} * {}), got {}",
+            expected,
+            num_entities,
+            l,
+            max_width,
+            scores_flat.len()
+        );
+    }
 
     let mut out = Vec::new();
 
     for p in 0..num_entities {
         let label = labels[p];
         let mut per_label = Vec::new();
+        let base = p * (l * max_width);
         for i in 0..l {
-            for (j, &conf) in scores_v[p][i].iter().enumerate().take(max_width) {
+            for j in 0..max_width {
+                let conf = scores_flat[base + i * max_width + j];
                 if conf >= threshold {
                     let end_token_idx = i + j;
                     if end_token_idx < l {
@@ -52,6 +69,69 @@ pub fn find_spans(
     }
 
     Ok(out)
+}
+
+/// Convenience when the `candle` feature is enabled: decode from a `[NumEntities, L, max_width]` tensor.
+#[cfg(feature = "candle")]
+pub fn find_spans_tensor(
+    scores: &candle_core::Tensor,
+    threshold: f32,
+    labels: &[&str],
+    text: &str,
+    start_offsets: &[usize],
+    end_offsets: &[usize],
+) -> anyhow::Result<Vec<Entity>> {
+    let (num_entities, l, max_width) = scores.dims3().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let scores_v = scores
+        .flatten_all()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .to_vec1::<f32>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    find_spans(
+        &scores_v,
+        num_entities,
+        l,
+        max_width,
+        threshold,
+        labels,
+        text,
+        start_offsets,
+        end_offsets,
+    )
+}
+
+/// `[NumEntities, L, max_width]` LibTorch tensor → entities (`tch` feature).
+#[cfg(feature = "tch")]
+pub fn find_spans_tch_tensor(
+    scores: &tch::Tensor,
+    threshold: f32,
+    labels: &[&str],
+    text: &str,
+    start_offsets: &[usize],
+    end_offsets: &[usize],
+) -> Result<Vec<Entity>> {
+    let sz = scores.size();
+    if sz.len() != 3 {
+        bail!("find_spans_tch_tensor: expected 3D scores, got {} dims", sz.len());
+    }
+    let num_entities = sz[0] as usize;
+    let l = sz[1] as usize;
+    let max_width = sz[2] as usize;
+    let n = num_entities * l * max_width;
+    let flat_t = scores.flatten(0, 2);
+    let mut scores_v = vec![0f32; n];
+    flat_t.copy_data(&mut scores_v, n);
+    find_spans(
+        &scores_v,
+        num_entities,
+        l,
+        max_width,
+        threshold,
+        labels,
+        text,
+        start_offsets,
+        end_offsets,
+    )
 }
 
 pub fn greedy_select(mut entities: Vec<Entity>) -> Vec<Entity> {

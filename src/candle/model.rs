@@ -1,12 +1,13 @@
-use crate::config::ExtractorConfig;
-use crate::layers::{CountEmbed, create_mlp_from_dims};
+use crate::config::{ExtractorConfig, ModelFiles};
 use crate::processor::FormattedInput;
-use crate::span_rep::SpanMarkerV0;
-use candle_core::{D, DType, Result, Tensor};
+use super::layers::{CountEmbed, create_mlp_from_dims};
+use super::span_rep::SpanMarkerV0;
+use anyhow::Context;
+use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{Activation, Module, Sequential, VarBuilder};
 use candle_transformers::models::debertav2::{Config as DebertaConfig, DebertaV2Model};
 
-pub struct Extractor {
+pub struct CandleExtractor {
     encoder: DebertaV2Model,
     span_rep: SpanMarkerV0,
     classifier: Sequential,
@@ -16,8 +17,36 @@ pub struct Extractor {
     max_width: usize,
 }
 
-impl Extractor {
+impl CandleExtractor {
+    pub fn load_cpu(
+        files: &ModelFiles,
+        extract_config: ExtractorConfig,
+        processor_vocab_size: usize,
+    ) -> anyhow::Result<Self> {
+        Self::load(files, extract_config, processor_vocab_size, &Device::Cpu)
+    }
+
     pub fn load(
+        files: &ModelFiles,
+        extract_config: ExtractorConfig,
+        processor_vocab_size: usize,
+        device: &Device,
+    ) -> anyhow::Result<Self> {
+        let mut encoder_config: DebertaConfig =
+            serde_json::from_str(&std::fs::read_to_string(&files.encoder_config)?)
+                .context("parse encoder_config")?;
+        encoder_config.vocab_size = processor_vocab_size;
+
+        let dtype = DType::F32;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[files.weights.clone()], dtype, device)
+                .map_err(|e| anyhow::anyhow!("VarBuilder::from_mmaped_safetensors: {e}"))?
+        };
+
+        Self::load_raw(extract_config, encoder_config, vb).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    pub fn load_raw(
         config: ExtractorConfig,
         encoder_config: DebertaConfig,
         vb: VarBuilder,
@@ -70,11 +99,13 @@ impl Extractor {
         input_ids: &Tensor,
         attention_mask: &Tensor,
         formatted: &FormattedInput,
-    ) -> Result<Tensor> {
+    ) -> anyhow::Result<Tensor> {
         let encoder_output = self
             .encoder
-            .forward(input_ids, None, Some(attention_mask.clone()))?;
+            .forward(input_ids, None, Some(attention_mask.clone()))
+            .map_err(candle_err)?;
         self.forward_from_encoder_output(&encoder_output, formatted)
+            .map_err(candle_err)
     }
 
     /// NER PoC heads from encoder output `[B, seq, D]` (batch size 1).
@@ -309,5 +340,161 @@ impl Extractor {
         let count_logits = self.count_pred.forward(&p_embedding.unsqueeze(0)?)?;
         let pred_count = count_logits.argmax(D::Minus1)?.get(0)?.to_scalar::<u32>()? as usize;
         Ok(pred_count)
+    }
+}
+
+fn candle_err(e: candle_core::Error) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
+#[allow(clippy::needless_range_loop)]
+fn candle_tensor_to_vec4(t: &Tensor) -> candle_core::Result<Vec<Vec<Vec<Vec<f32>>>>> {
+    let dims = t.dims();
+    if dims.len() != 4 {
+        candle_core::bail!("expected 4D tensor");
+    }
+    let b = dims[0];
+    let p = dims[1];
+    let l = dims[2];
+    let k = dims[3];
+    let flat = t.flatten_all()?.to_vec1::<f32>()?;
+    let mut out = vec![vec![vec![vec![0f32; k]; l]; p]; b];
+    let mut idx = 0usize;
+    for bi in 0..b {
+        for pi in 0..p {
+            for li in 0..l {
+                for ki in 0..k {
+                    out[bi][pi][li][ki] = flat[idx];
+                    idx += 1;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl crate::engine::Gliner2Engine for CandleExtractor {
+    type Tensor = Tensor;
+
+    fn dup_tensor(&self, t: &Self::Tensor) -> Self::Tensor {
+        t.clone()
+    }
+
+    fn hidden_size(&self) -> usize {
+        CandleExtractor::hidden_size(self)
+    }
+
+    fn max_width(&self) -> usize {
+        CandleExtractor::max_width(self)
+    }
+
+    fn encode_sequence(&self, input_ids: &Tensor, attention_mask: &Tensor) -> anyhow::Result<Tensor> {
+        CandleExtractor::encode_sequence(self, input_ids, attention_mask).map_err(candle_err)
+    }
+
+    fn gather_text_word_embeddings(
+        &self,
+        last_hidden: &Tensor,
+        positions: &[usize],
+    ) -> anyhow::Result<Tensor> {
+        CandleExtractor::gather_text_word_embeddings(self, last_hidden, positions)
+            .map_err(candle_err)
+    }
+
+    fn gather_text_word_embeddings_batch_idx(
+        &self,
+        last_hidden: &Tensor,
+        batch_idx: usize,
+        positions: &[usize],
+    ) -> anyhow::Result<Tensor> {
+        CandleExtractor::gather_text_word_embeddings_batch_idx(self, last_hidden, batch_idx, positions)
+            .map_err(candle_err)
+    }
+
+    fn compute_span_rep(&self, text_word_embs: &Tensor) -> anyhow::Result<Tensor> {
+        CandleExtractor::compute_span_rep(self, text_word_embs).map_err(candle_err)
+    }
+
+    fn compute_span_rep_batched(&self, token_embs_list: &[Tensor]) -> anyhow::Result<Vec<Tensor>> {
+        CandleExtractor::compute_span_rep_batched(self, token_embs_list).map_err(candle_err)
+    }
+
+    fn classifier_logits(&self, label_rows: &Tensor) -> anyhow::Result<Tensor> {
+        CandleExtractor::classifier_logits(self, label_rows).map_err(candle_err)
+    }
+
+    fn count_predict(&self, p_embedding: &Tensor) -> anyhow::Result<usize> {
+        CandleExtractor::count_predict(self, p_embedding).map_err(candle_err)
+    }
+
+    fn span_scores_sigmoid(
+        &self,
+        span_rep: &Tensor,
+        field_embs: &Tensor,
+        pred_count: usize,
+    ) -> anyhow::Result<Tensor> {
+        CandleExtractor::span_scores_sigmoid(self, span_rep, field_embs, pred_count)
+            .map_err(candle_err)
+    }
+
+    fn single_sample_inputs(&self, input_ids: &[u32]) -> anyhow::Result<(Tensor, Tensor)> {
+        let device = Device::Cpu;
+        let t = Tensor::new(input_ids.to_vec(), &device)
+            .map_err(candle_err)?
+            .unsqueeze(0)
+            .map_err(candle_err)?;
+        let mask = Tensor::ones(t.dims(), DType::I64, &device).map_err(candle_err)?;
+        Ok((t, mask))
+    }
+
+    fn batch_inputs(
+        &self,
+        input_ids: Vec<u32>,
+        attention_mask_i64: Vec<i64>,
+        batch_size: usize,
+        max_seq_len: usize,
+    ) -> anyhow::Result<(Tensor, Tensor)> {
+        let device = Device::Cpu;
+        let ids =
+            Tensor::from_vec(input_ids, (batch_size, max_seq_len), &device).map_err(candle_err)?;
+        let mask = Tensor::from_vec(attention_mask_i64, (batch_size, max_seq_len), &device)
+            .map_err(candle_err)?;
+        Ok((ids, mask))
+    }
+
+    fn batch_row_hidden(&self, hidden: &Tensor, idx: usize) -> anyhow::Result<Tensor> {
+        hidden.get(idx).map_err(candle_err)
+    }
+
+    fn stack_schema_token_embeddings(
+        &self,
+        last_hidden_seq: &Tensor,
+        positions: &[usize],
+    ) -> anyhow::Result<Tensor> {
+        let mut embs = Vec::new();
+        for &p in positions {
+            embs.push(last_hidden_seq.get(p).map_err(candle_err)?);
+        }
+        Tensor::stack(&embs, 0).map_err(candle_err)
+    }
+
+    fn tensor_dim0(&self, t: &Tensor) -> anyhow::Result<usize> {
+        t.dim(0).map_err(candle_err)
+    }
+
+    fn tensor_narrow0(&self, t: &Tensor, start: usize, len: usize) -> anyhow::Result<Tensor> {
+        t.narrow(0, start, len).map_err(candle_err)
+    }
+
+    fn tensor_index0(&self, t: &Tensor, i: usize) -> anyhow::Result<Tensor> {
+        t.get(i).map_err(candle_err)
+    }
+
+    fn tensor_logits_1d(&self, logits: &Tensor) -> anyhow::Result<Vec<f32>> {
+        logits.to_vec1::<f32>().map_err(candle_err)
+    }
+
+    fn tensor_span_scores_to_vec4(&self, t: &Tensor) -> anyhow::Result<Vec<Vec<Vec<Vec<f32>>>>> {
+        candle_tensor_to_vec4(t).map_err(candle_err)
     }
 }

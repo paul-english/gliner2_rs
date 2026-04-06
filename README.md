@@ -118,31 +118,22 @@ Fair comparison needs **both** implementations on the same device class (for exa
 
 ## Usage
 
-Like the Python implementation, this crate supports a full extraction API. You load the model once, build a `SchemaTransformer` from the tokenizer, then call `Extractor` methods.
+Like the Python implementation, this crate supports a full extraction API. You load the model once, build a `SchemaTransformer` from the tokenizer, then call `CandleExtractor` (or `TchExtractor`) methods.
 
 ### Setup (load model + tokenizer)
 
 ```rust
 use anyhow::Result;
-use candle_core::Device;
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as DebertaConfig;
 use gliner2::config::{download_model, ExtractorConfig};
-use gliner2::{Extractor, SchemaTransformer};
+use gliner2::{CandleExtractor, SchemaTransformer};
 
-fn load_extractor(model_id: &str) -> Result<(Extractor, SchemaTransformer)> {
+fn load_extractor(model_id: &str) -> Result<(CandleExtractor, SchemaTransformer)> {
     let files = download_model(model_id)?;
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
-
-    let config: ExtractorConfig = serde_json::from_str(&std::fs::read_to_string(&files.config)?)?;
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&std::fs::read_to_string(&files.encoder_config)?)?;
     let transformer = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
-    encoder_config.vocab_size = transformer.tokenizer.get_vocab_size(true);
+    let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
+    let vocab = transformer.tokenizer.get_vocab_size(true);
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
-    let extractor = Extractor::load(config, encoder_config, vb)?;
+    let extractor = CandleExtractor::load_cpu(&files, config, vocab)?;
     Ok((extractor, transformer))
 }
 ```
@@ -281,7 +272,7 @@ Combines entities, classifications, relations, and structured fields in one enco
 
 ```rust
 use gliner2::{
-    create_schema, ExtractOptions, Extractor, SchemaTransformer, ValueDtype,
+    create_schema, ExtractOptions, CandleExtractor, SchemaTransformer, ValueDtype,
 };
 use serde_json::json;
 
@@ -322,7 +313,7 @@ Set `batch_size` on `ExtractOptions` for any batch method (it only affects chunk
 
 #### Shared schema (one schema for every text)
 
-Use the `Extractor` helpers; they build the same schema as the single-sample methods and call `batch_extract` internally.
+Use the `CandleExtractor` helpers; they build the same schema as the single-sample methods and call `batch_extract` internally.
 
 ```rust
 use gliner2::ExtractOptions;
@@ -482,11 +473,11 @@ flowchart LR
 
 | Subcommand          | Purpose                                      | Library analogue                                             |
 | ------------------- | -------------------------------------------- | ------------------------------------------------------------ |
-| `gliner2 entities`  | Named-entity extraction                      | `Extractor::extract_entities`, `Schema::entities`            |
-| `gliner2 classify`  | Text classification (single- or multi-label) | `Extractor::classify_text`, `Schema::classification`         |
-| `gliner2 relations` | Relation extraction                          | `Extractor::extract_relations`, `Schema::relations`          |
-| `gliner2 json`      | Structured JSON / field extraction           | `Extractor::extract_json`, `Schema::extract_json_structures` |
-| `gliner2 run`       | Multitask: full engine schema in one pass    | `Extractor::extract`                                         |
+| `gliner2 entities`  | Named-entity extraction                      | `CandleExtractor::extract_entities`, `Schema::entities`            |
+| `gliner2 classify`  | Text classification (single- or multi-label) | `CandleExtractor::classify_text`, `Schema::classification`         |
+| `gliner2 relations` | Relation extraction                          | `CandleExtractor::extract_relations`, `Schema::relations`          |
+| `gliner2 json`      | Structured JSON / field extraction           | `CandleExtractor::extract_json`, `Schema::extract_json_structures` |
+| `gliner2 run`       | Multitask: full engine schema in one pass    | `CandleExtractor::extract`                                         |
 
 
 Top-level: `gliner2 --help`, `gliner2 --version`, and `gliner2 <subcommand> --help`.
@@ -522,7 +513,7 @@ Use either Hub resolution (`--model`) **or** a local layout (`--model-dir` or ex
 
 ### Batching
 
-The **library** implements tensor batch inference (`Extractor::batch_extract*`, `ExtractOptions::batch_size`); see **[Batch inference](#batch-inference)** above. The **CLI** is not implemented yet; the contract below assumes the binary will drive those batched APIs for any input that produces **more than one logical record** (for example multi-line JSONL or plain text with `--text-split line` and multiple non-empty lines).
+The **library** implements tensor batch inference (`CandleExtractor::batch_extract*`, `ExtractOptions::batch_size`); see **[Batch inference](#batch-inference)** above. The **CLI** is not implemented yet; the contract below assumes the binary will drive those batched APIs for any input that produces **more than one logical record** (for example multi-line JSONL or plain text with `--text-split line` and multiple non-empty lines).
 
 
 | Flag               | Description                                                                                                                                        |
@@ -696,4 +687,3 @@ result = extractor.extract_entities(text, ["company", "person", "product", "loca
 print(result)
 # {'entities': {'company': ['Apple'], 'person': ['Tim Cook'], 'product': ['iPhone 15'], 'location': ['Cupertino']}}
 ```
-

@@ -2,12 +2,12 @@ pub mod config;
 pub mod decode;
 pub mod engine;
 pub mod extract;
-pub mod layers;
-pub mod model;
 pub mod preprocess;
 pub mod processor;
 pub mod schema;
-pub mod span_rep;
+
+#[cfg(feature = "candle")]
+pub mod candle;
 
 #[cfg(feature = "tch")]
 pub mod tch_backend;
@@ -19,7 +19,8 @@ pub use decode::Entity;
 pub use extract::{
     BatchSchemaMode, ExtractOptions, batch_extract, extract_from_preprocessed, extract_with_schema,
 };
-pub use model::Extractor;
+#[cfg(feature = "candle")]
+pub use candle::CandleExtractor;
 pub use preprocess::{PreprocessedBatch, PreprocessedInput, TaskType, collate_preprocessed};
 pub use processor::SchemaTransformer;
 pub use schema::{

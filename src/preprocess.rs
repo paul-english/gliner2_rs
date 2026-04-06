@@ -69,7 +69,7 @@ pub fn collate_preprocessed(samples: &[PreprocessedInput]) -> Option<Preprocesse
     })
 }
 
-/// Single-sample preprocessed input for `Extractor::extract_preprocessed`.
+/// Single-sample preprocessed input for `CandleExtractor::extract_preprocessed` (or `TchExtractor`).
 #[derive(Debug, Clone)]
 pub struct PreprocessedInput {
     pub input_ids: Vec<u32>,

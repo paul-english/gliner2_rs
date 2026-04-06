@@ -23,7 +23,7 @@ pub struct ParsedFieldSpec {
     pub description: Option<String>,
 }
 
-/// Parse a field spec string or object (Python `Extractor._parse_field_spec`).
+/// Parse a field spec string or object (Python `GLiNER2._parse_field_spec`).
 pub fn parse_field_spec(spec: &Value) -> AnyResult<ParsedFieldSpec> {
     if let Some(o) = spec.as_object() {
         let name = o

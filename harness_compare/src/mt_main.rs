@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
-use candle_core::Device;
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as DebertaConfig;
 #[cfg(feature = "tch-backend")]
 use gliner2::TchExtractor;
 use gliner2::config::download_model;
 use gliner2::extract::{ExtractOptions, extract_with_schema};
-use gliner2::{Extractor, ExtractorConfig, SchemaTransformer, infer_metadata_from_schema};
+use gliner2::{CandleExtractor, ExtractorConfig, SchemaTransformer, infer_metadata_from_schema};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
@@ -148,23 +145,16 @@ fn main() -> Result<()> {
 
     let load_start = Instant::now();
     let files = download_model(&model_id)?;
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
 
     let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&fs::read_to_string(&files.encoder_config)?)?;
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
     let vocab = processor.tokenizer.get_vocab_size(true);
-    encoder_config.vocab_size = vocab;
 
     let mut cases_out = Vec::with_capacity(fixtures.len());
 
     match backend {
         Backend::Candle => {
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
-            let extractor = Extractor::load(config, encoder_config, vb)?;
+            let extractor = CandleExtractor::load_cpu(&files, config, vocab)?;
             let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
             for f in fixtures {
@@ -204,8 +194,7 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "tch-backend")]
         Backend::Tch => {
-            let tch_extractor =
-                TchExtractor::load(&files, config, encoder_config, vocab, TchDevice::Cpu)?;
+            let tch_extractor = TchExtractor::load(&files, config, vocab, TchDevice::Cpu)?;
             let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
             for f in fixtures {

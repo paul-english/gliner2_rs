@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as DebertaConfig;
 #[cfg(feature = "tch-backend")]
 use gliner2::TchExtractor;
 use gliner2::config::download_model;
 use gliner2::decode::{self, Entity};
-use gliner2::{Extractor, ExtractorConfig, SchemaTransformer};
+use gliner2::{CandleExtractor, ExtractorConfig, Gliner2Engine, SchemaTransformer};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -143,23 +140,16 @@ fn main() -> Result<()> {
 
     let load_start = Instant::now();
     let files = download_model(&model_id)?;
-    let device = Device::Cpu;
-    let dtype = candle_core::DType::F32;
 
     let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&fs::read_to_string(&files.encoder_config)?)?;
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
     let vocab = processor.tokenizer.get_vocab_size(true);
-    encoder_config.vocab_size = vocab;
 
     let mut cases_out = Vec::with_capacity(fixtures.len());
 
     match backend {
         Backend::Candle => {
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
-            let extractor = Extractor::load(config, encoder_config, vb)?;
+            let extractor = CandleExtractor::load_cpu(&files, config, vocab)?;
             let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
             for f in fixtures {
@@ -167,11 +157,9 @@ fn main() -> Result<()> {
 
                 let infer_start = Instant::now();
                 let formatted = processor.format_input_for_ner(&f.text, &labels)?;
-                let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
-                let attention_mask =
-                    Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
+                let (input_ids, attention_mask) = extractor.single_sample_inputs(&formatted.input_ids)?;
                 let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
-                let entities = decode::find_spans(
+                let entities = decode::find_spans_tensor(
                     &scores,
                     f.threshold,
                     &labels,
@@ -203,8 +191,7 @@ fn main() -> Result<()> {
         }
         #[cfg(feature = "tch-backend")]
         Backend::Tch => {
-            let tch_extractor =
-                TchExtractor::load(&files, config, encoder_config, vocab, TchDevice::Cpu)?;
+            let tch_extractor = TchExtractor::load(&files, config, vocab, TchDevice::Cpu)?;
             let load_model_ms = load_start.elapsed().as_secs_f64() * 1000.0;
 
             for f in fixtures {
@@ -212,11 +199,10 @@ fn main() -> Result<()> {
 
                 let infer_start = Instant::now();
                 let formatted = processor.format_input_for_ner(&f.text, &labels)?;
-                let input_ids = Tensor::new(formatted.input_ids.clone(), &device)?.unsqueeze(0)?;
-                let attention_mask =
-                    Tensor::ones(input_ids.dims(), candle_core::DType::I64, &device)?;
+                let (input_ids, attention_mask) =
+                    tch_extractor.single_sample_inputs(&formatted.input_ids)?;
                 let scores = tch_extractor.forward(&input_ids, &attention_mask, &formatted)?;
-                let entities = decode::find_spans(
+                let entities = decode::find_spans_tch_tensor(
                     &scores,
                     f.threshold,
                     &labels,

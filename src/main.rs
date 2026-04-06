@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use candle_core::Device;
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::Config as DebertaConfig;
 use gliner2::config::{download_model, ModelFiles};
-use gliner2::engine::Gliner2Engine;
 use gliner2::{
-    batch_extract, infer_metadata_from_schema, BatchSchemaMode, ExtractOptions, Extractor,
-    ExtractorConfig, SchemaTransformer,
+    batch_extract, infer_metadata_from_schema, BatchSchemaMode, ExtractOptions, ExtractorConfig,
+    SchemaTransformer,
 };
+#[cfg(feature = "candle")]
+use gliner2::CandleExtractor;
 #[cfg(feature = "tch")]
 use gliner2::TchExtractor;
 use serde_json::{json, Value};
@@ -170,202 +168,10 @@ struct Record {
 }
 
 enum Engine {
-    Candle(Extractor),
+    #[cfg(feature = "candle")]
+    Candle(CandleExtractor),
     #[cfg(feature = "tch")]
     Tch(TchExtractor),
-}
-
-impl Gliner2Engine for Engine {
-    type Tensor = candle_core::Tensor;
-
-    fn hidden_size(&self) -> usize {
-        match self {
-            Engine::Candle(e) => e.hidden_size(),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.hidden_size(),
-        }
-    }
-
-    fn max_width(&self) -> usize {
-        match self {
-            Engine::Candle(e) => e.max_width(),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.max_width(),
-        }
-    }
-
-    fn encode_sequence(
-        &self,
-        input_ids: &Self::Tensor,
-        attention_mask: &Self::Tensor,
-    ) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::encode_sequence(e, input_ids, attention_mask),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.encode_sequence(input_ids, attention_mask),
-        }
-    }
-
-    fn gather_text_word_embeddings(
-        &self,
-        last_hidden: &Self::Tensor,
-        positions: &[usize],
-    ) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::gather_text_word_embeddings(e, last_hidden, positions),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.gather_text_word_embeddings(last_hidden, positions),
-        }
-    }
-
-    fn gather_text_word_embeddings_batch_idx(
-        &self,
-        last_hidden: &Self::Tensor,
-        batch_idx: usize,
-        positions: &[usize],
-    ) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => {
-                Gliner2Engine::gather_text_word_embeddings_batch_idx(e, last_hidden, batch_idx, positions)
-            }
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => {
-                e.gather_text_word_embeddings_batch_idx(last_hidden, batch_idx, positions)
-            }
-        }
-    }
-
-    fn compute_span_rep(&self, text_word_embs: &Self::Tensor) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::compute_span_rep(e, text_word_embs),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.compute_span_rep(text_word_embs),
-        }
-    }
-
-    fn compute_span_rep_batched(
-        &self,
-        token_embs_list: &[Self::Tensor],
-    ) -> Result<Vec<Self::Tensor>> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::compute_span_rep_batched(e, token_embs_list),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.compute_span_rep_batched(token_embs_list),
-        }
-    }
-
-    fn classifier_logits(&self, label_rows: &Self::Tensor) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::classifier_logits(e, label_rows),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.classifier_logits(label_rows),
-        }
-    }
-
-    fn count_predict(&self, p_embedding: &Self::Tensor) -> Result<usize> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::count_predict(e, p_embedding),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.count_predict(p_embedding),
-        }
-    }
-
-    fn span_scores_sigmoid(
-        &self,
-        span_rep: &Self::Tensor,
-        field_embs: &Self::Tensor,
-        pred_count: usize,
-    ) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::span_scores_sigmoid(e, span_rep, field_embs, pred_count),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.span_scores_sigmoid(span_rep, field_embs, pred_count),
-        }
-    }
-
-    fn single_sample_inputs(&self, input_ids: &[u32]) -> Result<(Self::Tensor, Self::Tensor)> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::single_sample_inputs(e, input_ids),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.single_sample_inputs(input_ids),
-        }
-    }
-
-    fn batch_inputs(
-        &self,
-        input_ids: Vec<u32>,
-        attention_mask_i64: Vec<i64>,
-        batch_size: usize,
-        max_seq_len: usize,
-    ) -> Result<(Self::Tensor, Self::Tensor)> {
-        match self {
-            Engine::Candle(e) => {
-                Gliner2Engine::batch_inputs(e, input_ids, attention_mask_i64, batch_size, max_seq_len)
-            }
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.batch_inputs(input_ids, attention_mask_i64, batch_size, max_seq_len),
-        }
-    }
-
-    fn batch_row_hidden(&self, hidden: &Self::Tensor, idx: usize) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::batch_row_hidden(e, hidden, idx),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.batch_row_hidden(hidden, idx),
-        }
-    }
-
-    fn stack_schema_token_embeddings(
-        &self,
-        last_hidden_seq: &Self::Tensor,
-        positions: &[usize],
-    ) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::stack_schema_token_embeddings(e, last_hidden_seq, positions),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.stack_schema_token_embeddings(last_hidden_seq, positions),
-        }
-    }
-
-    fn tensor_dim0(&self, t: &Self::Tensor) -> Result<usize> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::tensor_dim0(e, t),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.tensor_dim0(t),
-        }
-    }
-
-    fn tensor_narrow0(&self, t: &Self::Tensor, start: usize, len: usize) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::tensor_narrow0(e, t, start, len),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.tensor_narrow0(t, start, len),
-        }
-    }
-
-    fn tensor_index0(&self, t: &Self::Tensor, i: usize) -> Result<Self::Tensor> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::tensor_index0(e, t, i),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.tensor_index0(t, i),
-        }
-    }
-
-    fn tensor_logits_1d(&self, logits: &Self::Tensor) -> Result<Vec<f32>> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::tensor_logits_1d(e, logits),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.tensor_logits_1d(logits),
-        }
-    }
-
-    fn tensor_span_scores_to_vec4(&self, t: &Self::Tensor) -> Result<Vec<Vec<Vec<Vec<f32>>>>> {
-        match self {
-            Engine::Candle(e) => Gliner2Engine::tensor_span_scores_to_vec4(e, t),
-            #[cfg(feature = "tch")]
-            Engine::Tch(e) => e.tensor_span_scores_to_vec4(t),
-        }
-    }
 }
 
 fn resolve_model_files(cli: &Cli) -> Result<ModelFiles> {
@@ -412,31 +218,28 @@ fn main() -> Result<()> {
     let files = resolve_model_files(&cli)?;
 
     let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
-    let mut encoder_config: DebertaConfig =
-        serde_json::from_str(&fs::read_to_string(&files.encoder_config)?)?;
 
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
-    encoder_config.vocab_size = processor.tokenizer.get_vocab_size(true);
+    let vocab = processor.tokenizer.get_vocab_size(true);
 
     let engine = if cli.backend == "tch" {
         #[cfg(feature = "tch")]
         {
-            Engine::Tch(TchExtractor::load_cpu(
-                &files,
-                config,
-                encoder_config,
-                processor.tokenizer.get_vocab_size(true),
-            )?)
+            Engine::Tch(TchExtractor::load_cpu(&files, config, vocab)?)
         }
         #[cfg(not(feature = "tch"))]
         {
             anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
         }
     } else {
-        let device = Device::Cpu;
-        let dtype = candle_core::DType::F32;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[files.weights], dtype, &device)? };
-        Engine::Candle(Extractor::load(config, encoder_config, vb)?)
+        #[cfg(feature = "candle")]
+        {
+            Engine::Candle(CandleExtractor::load_cpu(&files, config, vocab)?)
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            anyhow::bail!("Backend \"candle\" requires the default `candle` feature");
+        }
     };
 
     let input_path = match &cli.command {
@@ -465,10 +268,30 @@ fn main() -> Result<()> {
     };
 
     let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
-    let results = batch_extract(&engine, &processor, &texts, BatchSchemaMode::Shared {
-        schema: &schema,
-        meta: &meta,
-    }, &opts)?;
+    let results = match &engine {
+        #[cfg(feature = "candle")]
+        Engine::Candle(e) => batch_extract(
+            e,
+            &processor,
+            &texts,
+            BatchSchemaMode::Shared {
+                schema: &schema,
+                meta: &meta,
+            },
+            &opts,
+        )?,
+        #[cfg(feature = "tch")]
+        Engine::Tch(e) => batch_extract(
+            e,
+            &processor,
+            &texts,
+            BatchSchemaMode::Shared {
+                schema: &schema,
+                meta: &meta,
+            },
+            &opts,
+        )?,
+    };
 
     let mut out_writer: Box<dyn io::Write> = if let Some(path) = &cli.output {
         Box::new(fs::File::create(path)?)
