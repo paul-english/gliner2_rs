@@ -1,7 +1,7 @@
 # Gliner2 Rust
 
 
-[![Build Status](https://github.com/paul-english/gliner2_rs/workflows/Continuous%20integration/badge.svg)](https://github.com/paul-english/gliner2_rs/actions)
+[![Build Status](https://github.com/paul-english/gliner2_rs/workflows/CI/badge.svg)](https://github.com/paul-english/gliner2_rs/actions)
 [![Latest version](https://img.shields.io/crates/v/gliner2.svg)](https://crates.io/crates/gliner2)
 [![Documentation](https://docs.rs/gliner2/badge.svg)](https://docs.rs/gliner2)
 [![Dependency Status](https://deps.rs/repo/github/paul-english/gliner2_rs/status.svg)](https://deps.rs/repo/github/paul-english/gliner2_rs)
