@@ -1,8 +1,11 @@
 # Gliner2 Rust
 
-[Latest version](https://crates.io/crates/gliner2)
-[Documentation](https://docs.rs/gliner2)
-[License](https://github.com/huggingface/gliner2/blob/main/LICENSE)
+
+[![Build Status](https://github.com/paul-english/gliner2_rs/workflows/Continuous%20integration/badge.svg)](https://github.com/paul-english/gliner2_rs/actions)
+[![Latest version](https://img.shields.io/crates/v/gliner2.svg)](https://crates.io/crates/gliner2)
+[![Documentation](https://docs.rs/gliner2/badge.svg)](https://docs.rs/gliner2)
+[![Dependency Status](https://deps.rs/repo/github/paul-english/gliner2_rs/status.svg)](https://deps.rs/repo/github/paul-english/gliner2_rs)
+![License](https://img.shields.io/crates/l/gliner2.svg)
 
 This project implements the [Gliner2](https://github.com/fastino-ai/GLiNER2) model in rust with compatibility to the original weights and output of the python training.
 
