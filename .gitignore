@@ -1,3 +1,5 @@
 /target
 harness/.venv
 harness/_*.json
+harness/.compare_last
+harness/__pycache__

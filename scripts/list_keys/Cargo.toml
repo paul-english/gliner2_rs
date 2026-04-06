@@ -10,4 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-safetensors = "0.4"
+safetensors = "0.7"

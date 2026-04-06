@@ -49,7 +49,7 @@ fn parse_args() -> Result<(String, String, usize, usize, usize, Backend)> {
     let mut fixtures_path: Option<String> = None;
     let mut model_id = DEFAULT_MODEL_ID.to_string();
     let mut samples = 64usize;
-    let mut warmup = 2usize;
+    let mut warmup = 8usize;
     let mut rust_batch_size = 1usize;
     let mut backend = Backend::Candle;
 
@@ -118,7 +118,7 @@ fn parse_args() -> Result<(String, String, usize, usize, usize, Backend)> {
     }
 
     let fixtures_path = fixtures_path.context(
-        "usage: harness_throughput <fixtures.json> [--samples 64] [--warmup 2] [--model-id ID] [--rust-batch-size B] [--backend candle|tch]",
+        "usage: harness_throughput <fixtures.json> [--samples 64] [--warmup 8] [--model-id ID] [--rust-batch-size B] [--backend candle|tch]",
     )?;
 
     Ok((

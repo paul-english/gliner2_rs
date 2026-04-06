@@ -1,6 +1,6 @@
 ---
 id: gli-4ck0
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-05T15:49:37Z

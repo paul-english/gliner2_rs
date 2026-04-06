@@ -31,12 +31,17 @@ def main() -> int:
     )
     p.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     p.add_argument("--samples", type=int, default=64)
-    p.add_argument("--warmup", type=int, default=2, help="full passes over all samples")
+    p.add_argument("--warmup", type=int, default=8, help="full passes over all samples")
     p.add_argument("--device", choices=("auto", "cpu"), default="cpu")
     p.add_argument(
         "--mode",
         choices=("sequential", "batched", "both"),
         default="both",
+    )
+    p.add_argument(
+        "--batched-batch-sizes",
+        default="8,64",
+        help="Comma-separated batch sizes for batched mode (default: 8,64)",
     )
     p.add_argument("--out", default="-")
     args = p.parse_args()
@@ -63,6 +68,23 @@ def main() -> int:
     )
     texts = load_texts(fixtures_path, args.samples)
     threshold = 0.5
+
+    batch_sizes: list[int] = []
+    for part in args.batched_batch_sizes.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        batch_sizes.append(int(part))
+    if not batch_sizes:
+        batch_sizes = [8, 64]
+
+    for bs in batch_sizes:
+        if bs < 1 or bs > args.samples:
+            print(
+                f"error: batched batch size {bs} must be in [1, samples={args.samples}]",
+                file=sys.stderr,
+            )
+            return 1
 
     from gliner2 import GLiNER2
 
@@ -100,8 +122,7 @@ def main() -> int:
         sps = args.samples / (elapsed_ms / 1000.0) if elapsed_ms > 0 else float("inf")
         return elapsed_ms, sps
 
-    def run_batched() -> tuple[float, float]:
-        bs = args.samples
+    def run_batched_bs(bs: int) -> tuple[float, float]:
         for _ in range(args.warmup):
             model.batch_extract_entities(
                 texts,
@@ -144,13 +165,19 @@ def main() -> int:
         }
 
     if args.mode in ("batched", "both"):
-        total_ms, sps = run_batched()
-        payload["batched"] = {
-            "mode": "batched",
-            "batch_size": args.samples,
-            "total_infer_ms": total_ms,
-            "samples_per_sec": sps,
-        }
+        batched_by_size: dict[str, Any] = {}
+        for bs in batch_sizes:
+            total_ms, sps = run_batched_bs(bs)
+            batched_by_size[str(bs)] = {
+                "mode": "batched",
+                "batch_size": bs,
+                "total_infer_ms": total_ms,
+                "samples_per_sec": sps,
+            }
+        payload["batched_by_size"] = batched_by_size
+        # Backward compatibility: largest batch size as legacy `batched` key
+        max_bs = max(batch_sizes)
+        payload["batched"] = batched_by_size[str(max_bs)]
 
     text = json.dumps(payload, indent=2)
     if args.out == "-":

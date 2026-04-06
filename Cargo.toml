@@ -25,11 +25,11 @@ members = ["harness_compare", "scripts/list_keys"]
 resolver = "2"
 
 [dependencies]
-candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
-hf-hub = "0.4"
-tokenizers = "0.21"
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+hf-hub = "0.5"
+tokenizers = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -37,7 +37,7 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tch = { version = "0.23", optional = true }
-safetensors = { version = "0.4", optional = true }
+safetensors = { version = "0.7", optional = true }
 half = { version = "2", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 rayon = "1"

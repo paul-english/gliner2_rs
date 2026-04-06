@@ -25,11 +25,15 @@ The [harness/](harness/) scripts run the same **release** Rust binaries (`harnes
 
 ```bash
 uv sync --locked --directory harness
+# All three flows (entity + multitask + throughput), each with Rust Candle + Rust tch-rs + Python.
+# Optional: --candle-only (skip tch-rs / LibTorch), --update-readme (refresh comparison tables in this file)
+bash harness/run_compare_all.sh
+# Or run steps separately:
 bash harness/run_all.sh
 bash harness/run_multitask.sh
 ```
 
-**Rust (tch-rs) timings in the tables:** set `GLINER2_BENCH_TCH=1` when running the scripts above and `bash harness/run_throughput.sh`. The harness rebuilds `harness_compare` / `harness_throughput` with `--features tch-backend,download-libtorch`, so `torch-sys` downloads a **CPU LibTorch** that matches the pinned `tch` crate (no system LibTorch required). Before running the release binaries, the scripts source [harness/prepend_libtorch_ld_path.sh](harness/prepend_libtorch_ld_path.sh) so the dynamic loader can find `libtorch_cpu.so` under `target/release/build/torch-sys-*/out/...`. Alternatively, install LibTorch yourself and set `LIBTORCH` / `LD_LIBRARY_PATH`; then build with `tch-backend` only (omit `download-libtorch`).
+**Rust (tch-rs) timings in the tables:** `bash harness/run_compare_all.sh` sets `GLINER2_BENCH_TCH=1` so every step runs **Candle, tch-rs, and Python**. For `run_all.sh` / `run_multitask.sh` / `run_throughput.sh` alone, set `GLINER2_BENCH_TCH=1` yourself when you want tch-rs. The harness rebuilds `harness_compare` / `harness_throughput` with `--features tch-backend,download-libtorch`, so `torch-sys` downloads a **CPU LibTorch** that matches the pinned `tch` crate (no system LibTorch required). Before running the release binaries, the scripts source [harness/prepend_libtorch_ld_path.sh](harness/prepend_libtorch_ld_path.sh) so the dynamic loader can find `libtorch_cpu.so` under `target/release/build/torch-sys-*/out/...`. Alternatively, install LibTorch yourself and set `LIBTORCH` / `LD_LIBRARY_PATH`; then build with `tch-backend` only (omit `download-libtorch`).
 
 **Entity/multitask compare vs tch:** `compare.py` / `compare_mt.py` check **Candle Rust vs Python** for correctness. The tch JSON is used for **extra timing columns** only. On the current LibTorch encoder bridge, **NER fixture outputs from `--backend tch` can be empty or otherwise diverge from Candle** while wall-clock `infer_ms` is still meaningful. To run the full shell flow without failing on unrelated checks, use `GLINER2_COMPARE_WARN_ONLY=1` with `run_all.sh` / `run_multitask.sh` when needed.
 
@@ -37,43 +41,53 @@ The shell wrappers call Python with `CUDA_VISIBLE_DEVICES=` and `--device cpu` s
 
 For **apples-to-apples timing** with the Rust single-forward path, Python uses `**batch_size=1`**: `batch_extract_entities([text], …, batch_size=1)` on the entity harness and `batch_extract([text], schema, batch_size=1, …)` on the multitask harness (instead of relying on `extract` / `extract_entities` defaults).
 
-**Reading ratios:** for infer times, `python/candle` is `(python infer_ms) / (rust Candle infer_ms)` per case or for the total line. Values **below 1** mean Python spent less time on that measure for these fixtures; **above 1** mean Python was slower. With `GLINER2_BENCH_TCH=1`, `compare.py` / `compare_mt.py` also print `tch/candle` and `python/tch`.
+**Reading ratios:** for infer times, `python/candle` is `(python infer_ms) / (rust Candle infer_ms)` per case or for the total line. Values **below 1** mean Python spent less time on that measure for these fixtures; **above 1** mean Python was slower. When tch-rs is included (default for `run_compare_all.sh`, or `GLINER2_BENCH_TCH=1` for `run_all.sh` / `run_multitask.sh` alone), `compare.py` / `compare_mt.py` also print `tch/candle` and `python/tch`. The **per-case entity table** below lists both `python/candle` and `python/tch` (the latter is `(python infer_ms) / (rust tch-rs infer_ms)`). In the **auto-generated** tables from `patch_readme.py`, **bold** marks the **lowest** time in milliseconds in that row (load, sum, per-case, or throughput lane) and the **highest** samples/s in throughput rows; ties are all bolded.
 
 ### CPU vs CPU (recorded)
 
+<!-- gliner2-harness:cpu-recorded -->
 Model: `fastino/gliner2-base-v1`. **Recorded:** 2026-04-05 (Linux x86_64, local run; numbers vary by machine and load). **tch-rs `infer_ms`:** LibTorch encoder path with `download-libtorch` + [prepend_libtorch_ld_path.sh](harness/prepend_libtorch_ld_path.sh); see caveat above on NER outputs vs Candle.
+<!-- /gliner2-harness:cpu-recorded -->
 
 **Entity harness** ([harness/fixtures.json](harness/fixtures.json)) — metadata and per-case infer times:
 
 
+<!-- gliner2-harness:entity-summary -->
 |                              | Rust (Candle) | Rust (tch-rs)   | Python           |
 | ---------------------------- | ------------- | --------------- | ---------------- |
-| `device_note`                | `cpu`         | `cpu_libtorch`† | `cpu`            |
-| `load_model_ms`              | 494.0         | 1544.3          | 17435.6          |
-| Sum of `infer_ms` over cases | 678.2         | 325.6           | 647.7            |
-| Ratios (total infer)         | —             | tch/cnd **0.48×** | py/cnd **0.95×**; py/tch **1.99×** |
+| `device_note`                | `cpu`         | `cpu_libtorch` | `cpu`            |
+| `load_model_ms`              | 262.0         | 1072.3          | 3422.5          |
+| Sum of `infer_ms` over cases | 378.1         | 151.7           | 249.0            |
+| Ratios (total infer)         | —             | tch/cnd **0.40×** | py/cnd **0.66×**; py/tch **1.64×** |
+<!-- /gliner2-harness:entity-summary -->
 
 
-† Expected device label for the tch harness JSON when `GLINER2_BENCH_TCH=1` is enabled.
+<!-- gliner2-harness:entity-footnote -->
+† Expected device label for tch-rs harness JSON when LibTorch is used (`run_compare_all.sh` enables this by default; otherwise set `GLINER2_BENCH_TCH=1`).
+<!-- /gliner2-harness:entity-footnote -->
 
 
-| Case id             | Candle `infer_ms` | tch-rs `infer_ms` | python `infer_ms` | `python/candle` |
-| ------------------- | ----------------- | ----------------- | ----------------- | --------------- |
-| `steve_jobs`        | 178.2             | 86.6              | 402.4             | 2.26×           |
-| `tim_cook_iphone`   | 183.6             | 84.4              | 85.3              | 0.46×           |
-| `sundar_pichai`     | 163.3             | 80.6              | 83.7              | 0.51×           |
-| `microsoft_windows` | 153.1             | 74.0              | 76.3              | 0.50×           |
+<!-- gliner2-harness:entity-cases -->
+| Case id             | Candle `infer_ms` | tch-rs `infer_ms` | python `infer_ms` | `python/candle` | `python/tch` |
+| ------------------- | ----------------- | ----------------- | ----------------- | --------------- | ------------ |
+| `microsoft_windows` | 86.8 | 35.9 | 50.2 | 0.58× | 1.40× |
+| `steve_jobs` | 94.5 | 38.8 | 72.6 | 0.77× | 1.87× |
+| `sundar_pichai` | 96.3 | 36.9 | 59.7 | 0.62× | 1.62× |
+| `tim_cook_iphone` | 100.6 | 40.0 | 66.4 | 0.66× | 1.66× |
+<!-- /gliner2-harness:entity-cases -->
 
 
 **Multitask harness** ([harness/fixtures_multitask.json](harness/fixtures_multitask.json)) — single fixture `entities_plus_sentiment`:
 
 
+<!-- gliner2-harness:multitask-summary -->
 |                      | Rust (Candle) | Rust (tch-rs)   | Python           |
 | -------------------- | ------------- | --------------- | ---------------- |
-| `device_note`        | `cpu`         | `cpu_libtorch`† | `cpu`            |
-| `load_model_ms`      | 435.2         | 2020.4          | 4619.1           |
-| Sum of `infer_ms`    | 208.5         | 484.5           | 144.4            |
-| Ratios (total infer) | —             | tch/cnd **2.32×** | py/cnd **0.69×**; py/tch **0.30×** |
+| `device_note`        | `cpu`         | `cpu_libtorch` | `cpu`            |
+| `load_model_ms`      | 244.4         | 1091.5          | 3133.2           |
+| Sum of `infer_ms`    | 100.2         | 42.4           | 82.5            |
+| Ratios (total infer) | —             | tch/cnd **0.42×** | py/cnd **0.82×**; py/tch **1.95×** |
+<!-- /gliner2-harness:multitask-summary -->
 
 
 These are **short-fixture** timings. Update the tables when you change the model, fixtures, or harness code in a way that affects performance.
@@ -82,30 +96,36 @@ These are **short-fixture** timings. Update the tables when you change the model
 
 **These benchmarks are not run in GitHub Actions** (see [.github/workflows/ci.yml](.github/workflows/ci.yml)). Run them on your machine when you need larger-sample timing.
 
-The harness uses **64 samples** by default, built by cycling texts from [harness/fixtures.json](harness/fixtures.json). Every sample uses the same entity label list `["company", "person", "product", "location", "date"]` so Rust [batch_extract_entities](src/extract.rs) and PyPI `batch_extract_entities` can process the full set with `**batch_size=64`**. **Sequential rows** use **64× micro-batches of size 1** on both sides (Rust’s `forward` loop vs Python `batch_extract_entities([t], …, batch_size=1)`). **Batched rows** use one logical batch of 64 on each side.
+The harness uses **64 samples** by default, built by cycling texts from [harness/fixtures.json](harness/fixtures.json). Every sample uses the same entity label list `["company", "person", "product", "location", "date"]` so Rust [batch_extract_entities](src/extract.rs) and PyPI `batch_extract_entities` can process the full set. **Sequential rows** use **64× micro-batches of size 1** on both sides (Rust’s `forward` loop vs Python `batch_extract_entities([t], …, batch_size=1)`). **Batched rows** are timed at **`batch_size` 8 and 64** (Rust `--rust-batch-size` and Python `batch_extract_entities` with the same batch sizes).
 
 ```bash
 uv sync --locked --directory harness
 bash harness/run_throughput.sh
 ```
 
-Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [rust_batch_out.json] [samples]`. The script runs [harness/compare_throughput.py](harness/compare_throughput.py) on the three JSON outputs.
+Optional: `bash harness/run_throughput.sh [fixtures.json] [rust_seq_out.json] [rust_batch_8_out.json] [rust_batch_64_out.json] [samples] [python_out.json]`. The script runs [harness/compare_throughput.py](harness/compare_throughput.py) on the JSON outputs (sequential + batched batch sizes 8 and 64).
 
 Rust JSON includes a `backend` field (`candle` or `tch`). For LibTorch encoder timing only, set `GLINER2_THROUGHPUT_BACKEND=tch` (builds with `tch-backend,download-libtorch`). For **both** Rust backends plus Python in one run, use `GLINER2_BENCH_TCH=1 bash harness/run_throughput.sh`. You can also pass `--backend candle|tch` directly to `harness_throughput`.
 
-**Recorded:** 2026-04-05 (Linux x86_64, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=2` over all samples before each timed pass. [harness/compare_throughput.py](harness/compare_throughput.py) prints Candle vs tch vs Python (ratios: `py/cnd`, `tch/cnd`, `py/tch`).
+<!-- gliner2-harness:throughput-recorded -->
+**Recorded:** 2026-04-05 (Linux x86_64, local run, CPU, `CUDA_VISIBLE_DEVICES=` + `--device cpu` on Python). `warmup_full_passes=8` over all samples before each timed pass. [harness/compare_throughput.py](harness/compare_throughput.py) prints Candle vs tch vs Python (ratios: `py/cnd`, `tch/cnd`, `py/tch`).
+<!-- /gliner2-harness:throughput-recorded -->
 
 Batched Rust runs use Rayon for parallel preprocessing and per-record decode. The encoder forward pass is a single batched tensor op; parallelism applies to the CPU-bound work around it.
 
 
+<!-- gliner2-harness:throughput-table -->
 | Lane                           | Candle `infer_ms` | Candle s/s | tch-rs `infer_ms` | tch-rs s/s | Python `infer_ms` | Python s/s | py/candle | py/tch  |
 | ------------------------------ | ----------------- | ---------- | ----------------- | ---------- | ----------------- | ---------- | --------- | ------- |
-| Sequential (`batch_size` 1)    | 6877              | 9.31       | 3453              | 18.53      | 3799              | 16.85      | **0.55×** | 1.10×   |
-| Batched (`batch_size` 8)       | 6006              | 10.66      | 1389              | **46.08**  | 1573              | 40.68      | **0.26×** | 1.13×   |
-| Batched (`batch_size` 64)      | 5820              | 11.00      | 1267              | **50.50**  | 1304              | 49.08      | **0.22×** | 1.03×   |
+| Sequential (`batch_size` 1)    | 5702              | 11.22       | 3037              | 21.07       | 3475              | 18.42       | **0.61×** | 1.14×   |
+| Batched (`batch_size` 8)       | 3299              | 19.40       | 1395              | 45.87       | 1618              | 39.56       | **0.49×** | 1.16×   |
+| Batched (`batch_size` 64)      | 2801              | 22.85       | 1263              | 50.66       | 1237              | 51.75       | **0.44×** | 0.98×   |
+<!-- /gliner2-harness:throughput-table -->
 
 
-Load times: Candle ~436 ms; tch ~1660 ms; Python ~2503 ms.
+<!-- gliner2-harness:throughput-loads -->
+Load times: Candle ~243 ms; tch ~1089 ms; Python ~2190 ms.
+<!-- /gliner2-harness:throughput-loads -->
 
 **Notes:**
 - **tch-rs** is consistently faster than Python (~3–13% at batch_size 8–64). Both use LibTorch; tch-rs avoids Python interpreter overhead.
