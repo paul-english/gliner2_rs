@@ -14,8 +14,7 @@ include = [
     "/LICENSE",
     "/README.md",
     "/src/*.rs",
-    "/src/candle/**/*.rs",
-    "/src/tch_backend/*.rs",
+    "/src/backends/**/*.rs",
 ]
 
 # Note: `tch` pulls LibTorch (see torch-sys). Use `--features tch` when LibTorch is installed, or

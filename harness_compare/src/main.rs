@@ -157,7 +157,8 @@ fn main() -> Result<()> {
 
                 let infer_start = Instant::now();
                 let formatted = processor.format_input_for_ner(&f.text, &labels)?;
-                let (input_ids, attention_mask) = extractor.single_sample_inputs(&formatted.input_ids)?;
+                let (input_ids, attention_mask) =
+                    extractor.single_sample_inputs(&formatted.input_ids)?;
                 let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
                 let entities = decode::find_spans_tensor(
                     &scores,

@@ -40,7 +40,7 @@ impl TchExtractor {
         rb_cfg.vocab_size = processor_vocab_size as i64;
 
         let mut vs = nn::VarStore::new(device_tch);
-        let deberta = DebertaV2Model::new(&vs.root().sub("encoder"), &rb_cfg);
+        let deberta = DebertaV2Model::new(vs.root().sub("encoder"), &rb_cfg);
         vs.load(&files.weights)
             .map_err(|e| anyhow::anyhow!("tch VarStore::load: {e}"))?;
 
@@ -57,12 +57,7 @@ impl TchExtractor {
         extract_config: ExtractorConfig,
         processor_vocab_size: usize,
     ) -> Result<Self> {
-        Self::load(
-            files,
-            extract_config,
-            processor_vocab_size,
-            TchDevice::Cpu,
-        )
+        Self::load(files, extract_config, processor_vocab_size, TchDevice::Cpu)
     }
 
     pub fn load_from_paths(
@@ -82,7 +77,7 @@ impl TchExtractor {
         rb_cfg.vocab_size = processor_vocab_size as i64;
 
         let mut vs = nn::VarStore::new(device_tch);
-        let deberta = DebertaV2Model::new(&vs.root().sub("encoder"), &rb_cfg);
+        let deberta = DebertaV2Model::new(vs.root().sub("encoder"), &rb_cfg);
         vs.load(weights)
             .map_err(|e| anyhow::anyhow!("tch VarStore::load: {e}"))?;
 
@@ -101,8 +96,7 @@ impl TchExtractor {
         attention_mask: &Tensor,
         formatted: &FormattedInput,
     ) -> Result<Tensor> {
-        let enc =
-            tch::no_grad(|| self.encode_sequence_internal(input_ids, attention_mask))?;
+        let enc = tch::no_grad(|| self.encode_sequence_internal(input_ids, attention_mask))?;
         Ok(self.heads.forward_from_encoder_output(
             &enc,
             &formatted.text_word_first_positions,
@@ -110,7 +104,11 @@ impl TchExtractor {
         ))
     }
 
-    fn encode_sequence_internal(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    fn encode_sequence_internal(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> Result<Tensor> {
         let token_type = Tensor::zeros_like(input_ids);
         let out = self
             .deberta
@@ -195,9 +193,7 @@ impl Gliner2Engine for TchExtractor {
     fn single_sample_inputs(&self, input_ids: &[u32]) -> Result<(Tensor, Tensor)> {
         let dev = self.device_tch;
         let v: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
-        let t = Tensor::from_slice(&v)
-            .to_device(dev)
-            .unsqueeze(0);
+        let t = Tensor::from_slice(&v).to_device(dev).unsqueeze(0);
         let mask = Tensor::ones(t.size().as_slice(), (Kind::Int64, dev));
         Ok((t, mask))
     }
@@ -213,10 +209,10 @@ impl Gliner2Engine for TchExtractor {
         let v: Vec<i64> = input_ids.into_iter().map(|x| x as i64).collect();
         let ids = Tensor::from_slice(&v)
             .to_device(dev)
-            .reshape(&[batch_size as i64, max_seq_len as i64]);
+            .reshape([batch_size as i64, max_seq_len as i64]);
         let mask = Tensor::from_slice(&attention_mask_i64)
             .to_device(dev)
-            .reshape(&[batch_size as i64, max_seq_len as i64]);
+            .reshape([batch_size as i64, max_seq_len as i64]);
         Ok((ids, mask))
     }
 
@@ -268,16 +264,14 @@ impl Gliner2Engine for TchExtractor {
         let mut flat = vec![0f32; n];
         t.copy_data(&mut flat, n);
         let mut out = vec![vec![vec![vec![0f32; k]; l]; p]; b];
-        let mut idx = 0usize;
-        for bi in 0..b {
-            for pi in 0..p {
-                for li in 0..l {
-                    for ki in 0..k {
-                        out[bi][pi][li][ki] = flat[idx];
-                        idx += 1;
-                    }
-                }
-            }
+        for (dst, &src) in out
+            .iter_mut()
+            .flatten()
+            .flatten()
+            .flatten()
+            .zip(flat.iter())
+        {
+            *dst = src;
         }
         Ok(out)
     }

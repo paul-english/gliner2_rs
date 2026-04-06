@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use gliner2::TchExtractor;
 use gliner2::config::download_model;
 use gliner2::decode::{self, Entity};
-use gliner2::{ExtractOptions, CandleExtractor, ExtractorConfig, Gliner2Engine, SchemaTransformer};
+use gliner2::{CandleExtractor, ExtractOptions, ExtractorConfig, Gliner2Engine, SchemaTransformer};
 use serde::Serialize;
 use std::fs;
 use std::time::Instant;
@@ -205,16 +205,17 @@ fn main() -> Result<()> {
 
             let run_one = |text: &str| -> Result<Vec<Entity>> {
                 let formatted = processor.format_input_for_ner(text, &labels)?;
-                let (input_ids, attention_mask) = extractor.single_sample_inputs(&formatted.input_ids)?;
+                let (input_ids, attention_mask) =
+                    extractor.single_sample_inputs(&formatted.input_ids)?;
                 let scores = extractor.forward(&input_ids, &attention_mask, &formatted)?;
-                Ok(decode::find_spans_tensor(
+                decode::find_spans_tensor(
                     &scores,
                     threshold,
                     &labels,
                     text,
                     &formatted.start_offsets,
                     &formatted.end_offsets,
-                )?)
+                )
             };
 
             if rust_batch_size <= 1 {
@@ -299,14 +300,14 @@ fn main() -> Result<()> {
                 let (input_ids, attention_mask) =
                     tch_extractor.single_sample_inputs(&formatted.input_ids)?;
                 let scores = tch_extractor.forward(&input_ids, &attention_mask, &formatted)?;
-                Ok(decode::find_spans_tch_tensor(
+                decode::find_spans_tch_tensor(
                     &scores,
                     threshold,
                     &labels,
                     text,
                     &formatted.start_offsets,
                     &formatted.end_offsets,
-                )?)
+                )
             };
 
             if rust_batch_size <= 1 {

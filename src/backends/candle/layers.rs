@@ -3,35 +3,6 @@ use candle_nn::{
     Activation, Embedding, LayerNorm, Linear, Module, Sequential, VarBuilder, layer_norm,
 };
 
-pub fn create_mlp(
-    in_dim: usize,
-    intermediate_dims: &[usize],
-    out_dim: usize,
-    _dropout: f32,
-    activation: Activation,
-    vb: VarBuilder,
-) -> Result<Sequential> {
-    let mut seq = candle_nn::seq();
-    let mut current_dim = in_dim;
-
-    for (i, &dim) in intermediate_dims.iter().enumerate() {
-        let linear = candle_nn::linear(current_dim, dim, vb.pp(format!("0.{}", i * 2)))?; // This naming might be tricky with Sequential
-        seq = seq.add(linear);
-        seq = seq.add(activation);
-        // Dropout is usually a no-op during inference in candle
-        current_dim = dim;
-    }
-
-    let final_linear = candle_nn::linear(
-        current_dim,
-        out_dim,
-        vb.pp((intermediate_dims.len() * 2).to_string()),
-    )?;
-    seq = seq.add(final_linear);
-
-    Ok(seq)
-}
-
 // Custom MLP builder to match the Python create_mlp exactly in terms of Sequential indexing
 pub fn create_mlp_from_dims(
     input_dim: usize,

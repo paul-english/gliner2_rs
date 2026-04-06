@@ -15,6 +15,7 @@ pub struct Entity {
 ///
 /// `scores_flat` is row-major `[num_entities * l * max_width]` matching `scores[p][i][j]` =
 /// `scores_flat[p * (l * max_width) + i * max_width + j]`.
+#[allow(clippy::too_many_arguments)] // Mirrors tensor layout; grouping would not simplify call sites.
 pub fn find_spans(
     scores_flat: &[f32],
     num_entities: usize,
@@ -40,8 +41,7 @@ pub fn find_spans(
 
     let mut out = Vec::new();
 
-    for p in 0..num_entities {
-        let label = labels[p];
+    for (p, &label) in labels.iter().enumerate().take(num_entities) {
         let mut per_label = Vec::new();
         let base = p * (l * max_width);
         for i in 0..l {
@@ -112,7 +112,10 @@ pub fn find_spans_tch_tensor(
 ) -> Result<Vec<Entity>> {
     let sz = scores.size();
     if sz.len() != 3 {
-        bail!("find_spans_tch_tensor: expected 3D scores, got {} dims", sz.len());
+        bail!(
+            "find_spans_tch_tensor: expected 3D scores, got {} dims",
+            sz.len()
+        );
     }
     let num_entities = sz[0] as usize;
     let l = sz[1] as usize;

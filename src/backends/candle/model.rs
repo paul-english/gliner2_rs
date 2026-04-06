@@ -1,7 +1,7 @@
-use crate::config::{ExtractorConfig, ModelFiles};
-use crate::processor::FormattedInput;
 use super::layers::{CountEmbed, create_mlp_from_dims};
 use super::span_rep::SpanMarkerV0;
+use crate::config::{ExtractorConfig, ModelFiles};
+use crate::processor::FormattedInput;
 use anyhow::Context;
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{Activation, Module, Sequential, VarBuilder};
@@ -39,7 +39,7 @@ impl CandleExtractor {
 
         let dtype = DType::F32;
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[files.weights.clone()], dtype, device)
+            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&files.weights), dtype, device)
                 .map_err(|e| anyhow::anyhow!("VarBuilder::from_mmaped_safetensors: {e}"))?
         };
 
@@ -347,7 +347,6 @@ fn candle_err(e: candle_core::Error) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-#[allow(clippy::needless_range_loop)]
 fn candle_tensor_to_vec4(t: &Tensor) -> candle_core::Result<Vec<Vec<Vec<Vec<f32>>>>> {
     let dims = t.dims();
     if dims.len() != 4 {
@@ -359,16 +358,14 @@ fn candle_tensor_to_vec4(t: &Tensor) -> candle_core::Result<Vec<Vec<Vec<Vec<f32>
     let k = dims[3];
     let flat = t.flatten_all()?.to_vec1::<f32>()?;
     let mut out = vec![vec![vec![vec![0f32; k]; l]; p]; b];
-    let mut idx = 0usize;
-    for bi in 0..b {
-        for pi in 0..p {
-            for li in 0..l {
-                for ki in 0..k {
-                    out[bi][pi][li][ki] = flat[idx];
-                    idx += 1;
-                }
-            }
-        }
+    for (dst, &src) in out
+        .iter_mut()
+        .flatten()
+        .flatten()
+        .flatten()
+        .zip(flat.iter())
+    {
+        *dst = src;
     }
     Ok(out)
 }
@@ -388,7 +385,11 @@ impl crate::engine::Gliner2Engine for CandleExtractor {
         CandleExtractor::max_width(self)
     }
 
-    fn encode_sequence(&self, input_ids: &Tensor, attention_mask: &Tensor) -> anyhow::Result<Tensor> {
+    fn encode_sequence(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+    ) -> anyhow::Result<Tensor> {
         CandleExtractor::encode_sequence(self, input_ids, attention_mask).map_err(candle_err)
     }
 
@@ -407,8 +408,13 @@ impl crate::engine::Gliner2Engine for CandleExtractor {
         batch_idx: usize,
         positions: &[usize],
     ) -> anyhow::Result<Tensor> {
-        CandleExtractor::gather_text_word_embeddings_batch_idx(self, last_hidden, batch_idx, positions)
-            .map_err(candle_err)
+        CandleExtractor::gather_text_word_embeddings_batch_idx(
+            self,
+            last_hidden,
+            batch_idx,
+            positions,
+        )
+        .map_err(candle_err)
     }
 
     fn compute_span_rep(&self, text_word_embs: &Tensor) -> anyhow::Result<Tensor> {

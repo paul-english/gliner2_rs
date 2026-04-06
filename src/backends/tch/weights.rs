@@ -8,7 +8,6 @@ use tch::{Device, Tensor};
 
 pub struct TensorMap {
     pub tensors: HashMap<String, Tensor>,
-    pub device: Device,
 }
 
 pub fn load_safetensors(path: &Path, device: Device) -> Result<TensorMap> {
@@ -20,10 +19,7 @@ pub fn load_safetensors(path: &Path, device: Device) -> Result<TensorMap> {
         let t = view_to_tensor(&v, device).with_context(|| format!("convert {name}"))?;
         tensors.insert(name.to_string(), t);
     }
-    Ok(TensorMap {
-        tensors,
-        device,
-    })
+    Ok(TensorMap { tensors })
 }
 
 fn view_to_tensor(v: &safetensors::tensor::TensorView<'_>, device: Device) -> Result<Tensor> {

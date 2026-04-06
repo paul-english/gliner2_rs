@@ -40,7 +40,9 @@ fn tch_forward_matches_candle_within_tolerance() {
     let entities = ["person", "company", "location", "date"];
     let formatted = processor.format_input_for_ner(text, &entities).unwrap();
 
-    let (input_ids, attention_mask) = candle_ext.single_sample_inputs(&formatted.input_ids).unwrap();
+    let (input_ids, attention_mask) = candle_ext
+        .single_sample_inputs(&formatted.input_ids)
+        .unwrap();
     let s_c = candle_ext
         .forward(&input_ids, &attention_mask, &formatted)
         .unwrap();

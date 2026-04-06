@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gliner2::config::{download_model, ModelFiles};
-use gliner2::{
-    batch_extract, infer_metadata_from_schema, BatchSchemaMode, ExtractOptions, ExtractorConfig,
-    SchemaTransformer,
-};
 #[cfg(feature = "candle")]
 use gliner2::CandleExtractor;
 #[cfg(feature = "tch")]
 use gliner2::TchExtractor;
-use serde_json::{json, Value};
+use gliner2::config::{ModelFiles, download_model};
+use gliner2::{
+    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract,
+    infer_metadata_from_schema,
+};
+use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -167,6 +167,7 @@ struct Record {
     text: String,
 }
 
+#[allow(clippy::large_enum_variant)] // CLI holds one backend; boxing adds noise at every match.
 enum Engine {
     #[cfg(feature = "candle")]
     Candle(CandleExtractor),
@@ -328,14 +329,22 @@ fn main() -> Result<()> {
 fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     let (mut reader, path_is_jsonl, path_is_json) = if input == "-" {
-        (Box::new(io::BufReader::new(io::stdin())) as Box<dyn BufRead>, true, false)
+        (
+            Box::new(io::BufReader::new(io::stdin())) as Box<dyn BufRead>,
+            true,
+            false,
+        )
     } else {
         let path = Path::new(input);
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_jsonl = ext == "jsonl";
         let is_json = ext == "json";
         let file = fs::File::open(path)?;
-        (Box::new(io::BufReader::new(file)) as Box<dyn BufRead>, is_jsonl, is_json)
+        (
+            Box::new(io::BufReader::new(file)) as Box<dyn BufRead>,
+            is_jsonl,
+            is_json,
+        )
     };
 
     if path_is_json {
@@ -350,7 +359,9 @@ fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
     } else if path_is_jsonl {
         for line in reader.lines() {
             let line = line?;
-            if line.trim().is_empty() { continue; }
+            if line.trim().is_empty() {
+                continue;
+            }
             let val: Value = serde_json::from_str(&line)?;
             records.push(val_to_record(&val, cli)?);
         }
@@ -359,13 +370,21 @@ fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
         if cli.text_split == "line" {
             for line in reader.lines() {
                 let line = line?;
-                if line.trim().is_empty() { continue; }
-                records.push(Record { id: None, text: line });
+                if line.trim().is_empty() {
+                    continue;
+                }
+                records.push(Record {
+                    id: None,
+                    text: line,
+                });
             }
         } else {
             let mut content = String::new();
             reader.read_to_string(&mut content)?;
-            records.push(Record { id: None, text: content });
+            records.push(Record {
+                id: None,
+                text: content,
+            });
         }
     }
 
@@ -374,7 +393,8 @@ fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
 
 fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
     let obj = v.as_object().context("Expected JSON object for record")?;
-    let text = obj.get(&cli.text_field)
+    let text = obj
+        .get(&cli.text_field)
         .and_then(|t| t.as_str())
         .context(format!("Missing text field {:?} in record", cli.text_field))?
         .to_string();
@@ -385,7 +405,9 @@ fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
 fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::ExtractionMetadata)> {
     let mut s = gliner2::schema::create_schema();
     match cmd {
-        Commands::Entities { label, labels_json, .. } => {
+        Commands::Entities {
+            label, labels_json, ..
+        } => {
             if !label.is_empty() && labels_json.is_some() {
                 anyhow::bail!("Cannot provide both --label and --labels-json");
             }
@@ -396,7 +418,14 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
                 s.entities(json!(label));
             }
         }
-        Commands::Classify { task, label, labels_json, multi_label, cls_threshold, .. } => {
+        Commands::Classify {
+            task,
+            label,
+            labels_json,
+            multi_label,
+            cls_threshold,
+            ..
+        } => {
             if !label.is_empty() && labels_json.is_some() {
                 anyhow::bail!("Cannot provide both --label and --labels-json");
             }
@@ -407,7 +436,11 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
             };
             s.classification(task, labels, *multi_label, *cls_threshold);
         }
-        Commands::Relations { relation, relations_json, .. } => {
+        Commands::Relations {
+            relation,
+            relations_json,
+            ..
+        } => {
             if !relation.is_empty() && relations_json.is_some() {
                 anyhow::bail!("Cannot provide both --relation and --relations-json");
             }
@@ -418,17 +451,25 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
             };
             s.relations(rels);
         }
-        Commands::Json { structures, structures_json, .. } => {
+        Commands::Json {
+            structures,
+            structures_json,
+            ..
+        } => {
             if structures.is_some() && structures_json.is_some() {
                 anyhow::bail!("Cannot provide both --structures and --structures-json");
             }
             if let Some(path) = structures {
                 let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-                let obj = v.as_object().context("--structures must be a JSON object")?;
+                let obj = v
+                    .as_object()
+                    .context("--structures must be a JSON object")?;
                 s.extract_json_structures(obj)?;
             } else if let Some(js) = structures_json {
                 let v: Value = serde_json::from_str(js)?;
-                let obj = v.as_object().context("--structures-json must be a JSON object")?;
+                let obj = v
+                    .as_object()
+                    .context("--structures-json must be a JSON object")?;
                 s.extract_json_structures(obj)?;
             }
         }
