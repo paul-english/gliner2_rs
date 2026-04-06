@@ -3,6 +3,7 @@
 //! Weights load from the same `model.safetensors` as the Candle backend: encoder keys into
 //! `nn::VarStore`, head tensors via [`weights::load_safetensors`].
 
+mod deberta_v2;
 mod heads;
 mod weights;
 
@@ -10,8 +11,8 @@ use crate::config::{ExtractorConfig, ModelFiles};
 use crate::engine::Gliner2Engine;
 use crate::processor::FormattedInput;
 use anyhow::{Context, Result};
+use deberta_v2::{DebertaV2Config, DebertaV2Model};
 use heads::TchHeads;
-use rust_bert::deberta_v2::{DebertaV2Config, DebertaV2Model};
 use std::path::Path;
 use tch::{Device as TchDevice, Kind, Tensor, nn};
 
@@ -110,17 +111,14 @@ impl TchExtractor {
         attention_mask: &Tensor,
     ) -> Result<Tensor> {
         let token_type = Tensor::zeros_like(input_ids);
-        let out = self
-            .deberta
-            .forward_t(
-                Some(input_ids),
-                Some(attention_mask),
-                Some(&token_type),
-                None,
-                None,
-                false,
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let out = self.deberta.forward_t(
+            Some(input_ids),
+            Some(attention_mask),
+            Some(&token_type),
+            None,
+            None,
+            false,
+        )?;
         Ok(out.hidden_state)
     }
 }
