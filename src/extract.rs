@@ -817,6 +817,7 @@ fn format_spans(
             selected.push(s);
         }
     }
+    selected.sort_by_key(|s| (s.2, s.3));
     selected
 }
 
