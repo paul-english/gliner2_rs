@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "gliner2"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "gliner2-tch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",

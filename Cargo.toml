@@ -1,6 +1,6 @@
 [package]
 name = "gliner2"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.87"
 description = "Rust implementation of GLiNER2 with compatibility for upstream weights and Python training output."

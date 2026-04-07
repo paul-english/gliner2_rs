@@ -1,6 +1,6 @@
 [package]
 name = "gliner2-tch"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.87"
 description = "LibTorch-backed engine binary for gliner2. Invoked automatically by the gliner2 launcher."
