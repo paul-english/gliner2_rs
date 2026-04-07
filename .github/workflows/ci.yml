@@ -39,6 +39,9 @@ jobs:
       - name: cargo clippy (tch)
         run: cargo clippy -p gliner2 --all-targets --features tch,download-libtorch -- -D warnings
 
+      - name: cargo clippy (gliner2-tch crate)
+        run: cargo clippy -p gliner2-tch --all-targets --features download-libtorch -- -D warnings
+
       - name: cargo test (candle)
         run: cargo test --workspace
 

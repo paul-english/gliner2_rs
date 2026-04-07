@@ -1,4 +1,5 @@
 pub mod backends;
+pub mod cli;
 pub mod config;
 pub mod decode;
 pub mod engine;
@@ -6,6 +7,7 @@ pub mod extract;
 pub mod preprocess;
 pub mod processor;
 pub mod schema;
+pub mod setup;
 pub mod span_utils;
 
 pub use config::ExtractorConfig;

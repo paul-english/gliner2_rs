@@ -21,7 +21,11 @@ include = [
 # add `--features download-libtorch` so `torch-sys` downloads a matching LibTorch (see harness scripts).
 
 [workspace]
-members = ["harness_compare", "scripts/list_keys"]
+members = [
+"harness_compare",
+"scripts/list_keys",
+"crates/gliner2-tch",
+]
 resolver = "2"
 
 [dependencies]
@@ -36,17 +40,27 @@ anyhow = "1"
 regex = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-tch = { version = "0.23", optional = true }
+tch = { version = "0.24", optional = true }
 safetensors = { version = "0.7", optional = true }
 half = { version = "2", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 rayon = "1"
+dirs = "6"
+toml = { version = "0.8", features = ["preserve_order"] }
+ureq = "3"
+zip = "2"
+indicatif = "0.17"
 
 [features]
 default = ["candle"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 tch = ["dep:tch", "dep:safetensors", "dep:half"]
 download-libtorch = ["tch?/download-libtorch"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gliner2-{ target }.tar.gz"
+bin-dir = "bin/{ name }"
+pkg-fmt = "tgz"
 
 [[test]]
 name = "tch_parity"

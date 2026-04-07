@@ -26,7 +26,8 @@ repos:
         files: \.rs$
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        #entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: just clippy
         language: system
         pass_filenames: false
         files: \.rs$
