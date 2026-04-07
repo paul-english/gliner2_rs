@@ -1,4 +1,6 @@
 /target
+lcov.info
+*.profraw
 harness/.venv
 harness/_*.json
 harness/.compare_last
