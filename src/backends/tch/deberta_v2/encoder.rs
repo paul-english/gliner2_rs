@@ -534,15 +534,15 @@ impl DebertaV2Encoder {
         })
     }
 
+    /// Match candle-transformers `DebertaV2Encoder::get_attention_mask` (HF DeBERTa V2):
+    /// broadcast `[B, L]` to a pairwise `[B, 1, L, L]` content mask (float), no uint8 conversion.
     fn get_attention_mask(attention_mask: &Tensor) -> Tensor {
         match attention_mask.dim() {
-            value if value <= 2 => {
-                let extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2);
-                extended_attention_mask.as_ref()
-                    * extended_attention_mask
-                        .squeeze_dim(-2)
-                        .unsqueeze(-1)
-                        .to_kind(Kind::Uint8)
+            d if d <= 2 => {
+                let m = attention_mask.to_kind(Kind::Float);
+                let extended_attention_mask = m.unsqueeze(1).unsqueeze(2);
+                let right = extended_attention_mask.squeeze_dim(-2).unsqueeze(-1);
+                extended_attention_mask * right
             }
             3 => attention_mask.unsqueeze(1),
             _ => attention_mask.shallow_clone(),

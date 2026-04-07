@@ -630,7 +630,7 @@ impl TchHeads {
             let li = text_lengths[bi as usize] as i64;
             let mut buf = vec![0f32; (li * hidden) as usize];
             let blen = buf.len();
-            emb.copy_data(&mut buf, blen);
+            emb.contiguous().copy_data(&mut buf, blen);
             for j in 0..li {
                 let src = (j * hidden) as usize;
                 let dst = ((bi * max_text_len + j) * hidden) as usize;
@@ -696,6 +696,6 @@ impl TchHeads {
             let scores = scores.transpose(0, 1).reshape([p, l, max_w]);
             planes.push(scores.unsqueeze(0));
         }
-        Tensor::cat(&planes, 0).sigmoid()
+        Tensor::cat(&planes, 0).sigmoid().contiguous()
     }
 }

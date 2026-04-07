@@ -1,7 +1,7 @@
-//! LibTorch DeBERTa encoder (`rust-bert`) + GLiNER heads on `tch::Tensor` (no Candle).
+//! LibTorch DeBERTa encoder + GLiNER heads on `tch::Tensor`.
 //!
-//! Weights load from the same `model.safetensors` as the Candle backend: encoder keys into
-//! `nn::VarStore`, head tensors via [`weights::load_safetensors`].
+//! Encoder weights load from the same `model.safetensors` as the Candle backend (`nn::VarStore`),
+//! head tensors via [`weights::load_safetensors`].
 
 mod deberta_v2;
 mod device;
@@ -17,7 +17,8 @@ use anyhow::{Context, Result};
 use deberta_v2::{DebertaV2Config, DebertaV2Model};
 use heads::TchHeads;
 use std::path::Path;
-use tch::{Device as TchDevice, Kind, Tensor, nn};
+use tch::nn;
+use tch::{Device as TchDevice, Kind, Tensor};
 
 pub struct TchExtractor {
     #[allow(dead_code)]
@@ -254,11 +255,14 @@ impl Gliner2Engine for TchExtractor {
     fn tensor_logits_1d(&self, logits: &Tensor) -> Result<Vec<f32>> {
         let n = logits.numel();
         let mut v = vec![0f32; n];
-        logits.copy_data(&mut v, n);
+        logits.contiguous().copy_data(&mut v, n);
         Ok(v)
     }
 
     fn tensor_span_scores_to_vec4(&self, t: &Tensor) -> Result<Vec<Vec<Vec<Vec<f32>>>>> {
+        // Non-contiguous views (e.g. from cat/narrow) must be materialized before copy_data,
+        // or storage order does not match the nested Vec layout used by decoders.
+        let t = t.contiguous();
         let sz = t.size();
         if sz.len() != 4 {
             anyhow::bail!("expected 4D tensor");

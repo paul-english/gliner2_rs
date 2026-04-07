@@ -161,8 +161,12 @@ pub(crate) fn get_min(kind: Kind) -> Result<Scalar> {
     })
 }
 
+/// Match candle-transformers `XSoftmax::apply`: mask values 1 = keep, 0 = pad (masked out).
 pub fn x_softmax(input: &Tensor, mask: &Tensor, dim: i64) -> Tensor {
-    let inverse_mask = ((1 - mask) as Tensor).to_kind(Kind::Bool);
+    let rmask = mask.to_kind(Kind::Float).expand_as(input);
+    let inverse_mask = (Tensor::ones_like(&rmask) - &rmask)
+        .gt(0.0)
+        .to_kind(Kind::Bool);
     input
         .masked_fill(&inverse_mask, get_min(input.kind()).unwrap())
         .softmax(dim, input.kind())

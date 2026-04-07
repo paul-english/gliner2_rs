@@ -194,6 +194,8 @@ pub fn make_log_bucket_position(
     )
 }
 
+/// Match candle-transformers `build_relative_position`: `k_ids - q_ids` with shapes `[K,1]` and `[1,Q]`
+/// → `[K,Q]`, then optional log bucketing, then `narrow` + leading batch dim (see HF `modeling_deberta_v2`).
 pub fn build_relative_position(
     query_size: i64,
     key_size: i64,
@@ -201,13 +203,15 @@ pub fn build_relative_position(
     max_position: i64,
     device: Device,
 ) -> Tensor {
-    let q_ids = Tensor::arange(query_size, (Kind::Int64, device));
-    let k_ids = Tensor::arange(key_size, (Kind::Int64, device));
-    let mut rel_pos_ids = q_ids.unsqueeze(-1) - k_ids.tile([q_ids.size()[0], 1]);
-    if (bucket_size > 0) & (max_position > 0) {
+    let q_ids = Tensor::arange(query_size, (Kind::Int64, device)).view([1, query_size]);
+    let k_ids = Tensor::arange(key_size, (Kind::Int64, device)).view([key_size, 1]);
+    let mut rel_pos_ids = k_ids - q_ids;
+    if bucket_size > 0 && max_position > 0 {
         rel_pos_ids = make_log_bucket_position(&rel_pos_ids, bucket_size, max_position);
     }
-    rel_pos_ids.slice(0, 0, query_size, 1).unsqueeze(0)
+    rel_pos_ids = rel_pos_ids.to_kind(Kind::Int64);
+    rel_pos_ids = rel_pos_ids.narrow(0, 0, query_size);
+    rel_pos_ids.unsqueeze(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -231,14 +235,19 @@ pub struct DebertaV2DisentangledSelfAttention {
 }
 
 impl DebertaV2DisentangledSelfAttention {
+    /// `[B, S, H]` → `[B*H, S, D]` (matches candle-transformers / HF: merge batch×heads for batched matmul).
     fn transpose_for_scores(&self, x: &Tensor) -> Tensor {
         let mut new_shape = x.size();
         let _ = new_shape.pop();
         new_shape.extend_from_slice(&[self.num_attention_heads, -1]);
         let x = x.view(new_shape.as_slice());
-        x.permute([0, 2, 1, 3])
-            .contiguous()
-            .view([-1, x.size()[1], *x.size().last().unwrap()])
+        let x = x.permute([0, 2, 1, 3]).contiguous();
+        let sz = x.size();
+        let b = sz[0];
+        let h = sz[1];
+        let s = sz[2];
+        let d = sz[3];
+        x.view([b * h, s, d])
     }
 
     fn disentangled_att_bias(
@@ -299,9 +308,13 @@ impl DebertaV2DisentangledSelfAttention {
         let c2p_pos = if self.pos_att_type.has_type(PositionAttentionType::c2p)
             | self.pos_att_type.has_type(PositionAttentionType::p2p)
         {
-            let scale = *pos_key_layer.size().last().unwrap() as f64 * scale_factor;
+            let d_head = *pos_key_layer.size().last().unwrap() as f64;
+            let scale = (d_head * scale_factor).sqrt();
             let c2p_att = query_layer.bmm(&pos_key_layer.transpose(-1, -2));
-            let c2p_pos = relative_pos.clamp(0, att_span * 2 - 1);
+            // HF / candle: offset by att_span before clamping gather indices
+            let c2p_pos = (relative_pos.to_kind(Kind::Float) + att_span as f64)
+                .clamp(0.0, (att_span * 2 - 1) as f64)
+                .to_kind(Kind::Int64);
             let c2p_att = c2p_att.gather(
                 -1,
                 &c2p_pos.squeeze_dim(0).expand(
@@ -321,7 +334,8 @@ impl DebertaV2DisentangledSelfAttention {
         };
 
         if self.pos_att_type.has_type(PositionAttentionType::p2c) {
-            let scale = *pos_query_layer.size().last().unwrap() as f64 * scale_factor;
+            let d_head = *pos_query_layer.size().last().unwrap() as f64;
+            let scale = (d_head * scale_factor).sqrt();
             let r_pos = if key_layer_size[1] != query_layer_size[1] {
                 build_relative_position(
                     key_layer_size[1],
@@ -335,7 +349,9 @@ impl DebertaV2DisentangledSelfAttention {
                 relative_pos.shallow_clone()
             };
 
-            let p2c_pos = (-r_pos + att_span).clamp(0, 2 * att_span - 1);
+            let p2c_pos = (-r_pos.to_kind(Kind::Float) + att_span as f64)
+                .clamp(0.0, (att_span * 2 - 1) as f64)
+                .to_kind(Kind::Int64);
 
             let p2c_att = key_layer
                 .bmm(&pos_query_layer.transpose(-1, -2))
