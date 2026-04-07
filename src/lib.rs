@@ -15,6 +15,8 @@ pub use engine::Gliner2Engine;
 pub use backends::candle::CandleExtractor;
 #[cfg(feature = "tch")]
 pub use backends::tch::TchExtractor;
+#[cfg(feature = "tch")]
+pub use backends::tch::parse_tch_device;
 pub use decode::Entity;
 pub use extract::{
     BatchSchemaMode, ExtractOptions, batch_extract, extract_from_preprocessed, extract_with_schema,

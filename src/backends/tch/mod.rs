@@ -4,8 +4,11 @@
 //! `nn::VarStore`, head tensors via [`weights::load_safetensors`].
 
 mod deberta_v2;
+mod device;
 mod heads;
 mod weights;
+
+pub use device::parse_tch_device;
 
 use crate::config::{ExtractorConfig, ModelFiles};
 use crate::engine::Gliner2Engine;
