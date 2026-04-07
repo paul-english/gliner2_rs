@@ -17,6 +17,37 @@ cargo install gliner2
 # then: gliner2 --backend tch   (or GLINER2_BACKEND=tch)
 ```
 
+## Code coverage
+
+Rust tests are covered with [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) (LLVM source-based coverage). This does **not** measure the Python code under `harness/`.
+
+**One-time setup:**
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+```
+
+If the LLVM tools component is missing, `cargo llvm-cov` will report what to install.
+
+**Workspace (default features; matches `cargo test --workspace`):**
+
+```bash
+cargo llvm-cov --workspace --html
+# LCOV for external tools (writes lcov.info in the repo root; gitignored):
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+```
+
+Open the HTML report path printed by the command (artifacts live under `target/`, which is gitignored).
+
+**Optional — `gliner2` with `tch` + `download-libtorch` (matches CI `cargo test -p gliner2 --features tch,download-libtorch`):**
+
+```bash
+cargo llvm-cov -p gliner2 --features tch,download-libtorch --html
+```
+
+This exercises `tch_parity` and LibTorch-related code paths not covered by the default workspace run alone.
+
 ## Recorded speed (comparison harness)
 
 The [harness/](harness/) scripts run the same **release** Rust binaries (`harness_compare`, `harness_compare_mt` on CPU) against the PyPI `gliner2` package. Timing fields are wall-clock milliseconds from a single process: `load_model_ms` is one-time load; `infer_ms` is per-fixture forward work (entity harness sums all cases for the total row).
