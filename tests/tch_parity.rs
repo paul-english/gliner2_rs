@@ -15,7 +15,13 @@ fn max_abs_diff_slices(a: &[f32], b: &[f32]) -> f32 {
 fn tch_scores_to_vec(s: &tch::Tensor) -> Vec<f32> {
     let n = s.numel();
     let mut v = vec![0f32; n];
-    s.flatten(0, 2).copy_data(&mut v, n);
+    let dim = s.dim() as i64;
+    let flat = if dim <= 1 {
+        s.contiguous().view([-1])
+    } else {
+        s.contiguous().flatten(0, dim - 1)
+    };
+    flat.copy_data(&mut v, n);
     v
 }
 
