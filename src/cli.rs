@@ -9,6 +9,7 @@ use crate::{
 use crate::{TchExtractor, parse_tch_device};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, BufRead};
@@ -171,6 +172,160 @@ struct Record {
     text: String,
 }
 
+enum Input {
+    Stdin, // FIXME needs to be easily converted to StreamingRecord
+    Json(PathBuf),
+    Jsonl(PathBuf),
+    Parquet(PathBuf),
+    ParquetGlob(Vec<PathBuf>),
+    PlainText(String),
+    JsonText(String),
+}
+
+enum Output {
+    Jsonl,
+    Parquet(PathBuf),
+}
+
+impl Output {
+    fn resolve(input: &Input, cli: &Cli) -> Self {
+        let is_parquet_input = matches!(input, Input::Parquet(_) | Input::ParquetGlob(_));
+        if is_parquet_input {
+            if let Some(ref path) = cli.output {
+                if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                    return Output::Parquet(path.clone());
+                }
+                if path.is_dir() || !path.to_string_lossy().contains('.') {
+                    return Output::Parquet(path.clone());
+                }
+            }
+        }
+        Output::Jsonl
+    }
+}
+
+impl Input {
+    fn parse(s: &str) -> Result<Self> {
+        if s == "-" {
+            return Ok(Input::Stdin);
+        }
+        // Check for glob patterns
+        if s.contains('*') || s.contains('?') {
+            let mut paths: Vec<PathBuf> = glob::glob(s)
+                .map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if paths.is_empty() {
+                anyhow::bail!("No files matched glob pattern: {s}");
+            }
+            paths.sort();
+            if paths
+                .iter()
+                .all(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
+            {
+                return Ok(Input::ParquetGlob(paths));
+            }
+            anyhow::bail!(
+                "Glob pattern matched non-parquet files; glob input is only supported for .parquet files"
+            );
+        }
+        let path = Path::new(s);
+        Ok(match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => Input::Json(path.to_path_buf()),
+            Some("jsonl") => Input::Jsonl(path.to_path_buf()),
+            Some("parquet") => Input::Parquet(path.to_path_buf()),
+            Some("txt") | Some("md") => {
+                Input::PlainText(fs::read_to_string(path).unwrap_or_else(|_| s.to_string()))
+            }
+            _ => {
+                if path.exists() {
+                    Input::PlainText(fs::read_to_string(path).unwrap_or_else(|_| s.to_string()))
+                } else if s.starts_with('{') || s.starts_with('[') {
+                    Input::JsonText(s.to_string())
+                } else {
+                    Input::PlainText(s.to_string())
+                }
+            }
+        })
+    }
+
+    /// Bail if a `.jsonl` file is actually a JSON array.
+    fn validate_jsonl(path: &Path) -> Result<()> {
+        let file = fs::File::open(path)?;
+        let mut reader = io::BufReader::new(file);
+        let mut buf = [0u8; 1];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    if buf[0].is_ascii_whitespace() {
+                        continue;
+                    }
+                    if buf[0] == b'[' {
+                        anyhow::bail!(
+                            "{}: file starts with '[' (JSON array), but has .jsonl extension.\n\
+                             JSONL files must have one JSON object per line.\n\
+                             Rename to .json to treat as a JSON array.",
+                            path.display()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn iter_records(self, cli: &Cli) -> Result<Vec<Record>> {
+        match self {
+            Input::Parquet(path) => read_parquet_records(&path, cli),
+            Input::ParquetGlob(paths) => {
+                let mut records = Vec::new();
+                for path in &paths {
+                    records.extend(read_parquet_records(path, cli)?);
+                }
+                Ok(records)
+            }
+            Input::Json(path) => {
+                let val: Value =
+                    serde_json::from_reader(io::BufReader::new(fs::File::open(&path)?))?;
+                if let Some(arr) = val.as_array() {
+                    arr.iter().map(|v| val_to_record(v, cli)).collect()
+                } else {
+                    Ok(vec![val_to_record(&val, cli)?])
+                }
+            }
+            Input::Jsonl(path) => {
+                Self::validate_jsonl(&path)?;
+                read_jsonl(io::BufReader::new(fs::File::open(&path)?), cli)
+            }
+            Input::Stdin => read_jsonl(io::BufReader::new(io::stdin()), cli),
+            Input::JsonText(text) => {
+                let val: Value = serde_json::from_str(&text)?;
+                if let Some(arr) = val.as_array() {
+                    arr.iter().map(|v| val_to_record(v, cli)).collect()
+                } else {
+                    Ok(vec![val_to_record(&val, cli)?])
+                }
+            }
+            Input::PlainText(text) => {
+                if cli.text_split == "line" {
+                    Ok(text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| Record {
+                            id: None,
+                            text: l.to_string(),
+                        })
+                        .collect())
+                } else {
+                    Ok(vec![Record { id: None, text }])
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 enum Engine {
     #[cfg(feature = "candle")]
@@ -244,11 +399,8 @@ pub fn run(cli: Cli, backend: &str) -> Result<()> {
         Commands::Run { input, .. } => input,
     };
 
-    let records = gather_records(input_path, &cli)?;
-
-    if records.is_empty() {
-        return Ok(());
-    }
+    let input = Input::parse(input_path)?;
+    let output_format = Output::resolve(&input, &cli);
 
     let (schema, meta) = build_schema_and_meta(&cli.command)?;
 
@@ -261,32 +413,75 @@ pub fn run(cli: Cli, backend: &str) -> Result<()> {
         batch_size: cli.batch_size,
     };
 
+    // Multi-file parquet: process each file independently
+    if let Input::ParquetGlob(ref paths) = input {
+        if let Output::Parquet(ref out_dir) = output_format {
+            fs::create_dir_all(out_dir)?;
+            for in_path in paths {
+                let records = read_parquet_records(in_path, &cli)?;
+                if records.is_empty() {
+                    continue;
+                }
+                let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+                let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
+                let out_path =
+                    out_dir.join(in_path.file_name().context("input file has no filename")?);
+                write_parquet_output(&out_path, &records, &results, &cli)?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Single-input path (or JSONL output for any input)
+    let records = input.iter_records(&cli)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+
     let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
-    let results = match &engine {
+    let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
+
+    match output_format {
+        Output::Parquet(ref path) => {
+            write_parquet_output(path, &records, &results, &cli)?;
+        }
+        Output::Jsonl => {
+            write_jsonl_output(&records, &results, &cli)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_extract(
+    engine: &Engine,
+    processor: &SchemaTransformer,
+    texts: &[String],
+    schema: &Value,
+    meta: &crate::schema::ExtractionMetadata,
+    opts: &ExtractOptions,
+) -> Result<Vec<Value>> {
+    match engine {
         #[cfg(feature = "candle")]
         Engine::Candle(e) => batch_extract(
             e,
-            &processor,
-            &texts,
-            BatchSchemaMode::Shared {
-                schema: &schema,
-                meta: &meta,
-            },
-            &opts,
-        )?,
+            processor,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+        ),
         #[cfg(feature = "tch")]
         Engine::Tch(e) => batch_extract(
             e,
-            &processor,
-            &texts,
-            BatchSchemaMode::Shared {
-                schema: &schema,
-                meta: &meta,
-            },
-            &opts,
-        )?,
-    };
+            processor,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+        ),
+    }
+}
 
+fn write_jsonl_output(records: &[Record], results: &[Value], cli: &Cli) -> Result<()> {
     let mut out_writer: Box<dyn io::Write> = if let Some(path) = &cli.output {
         Box::new(fs::File::create(path)?)
     } else {
@@ -304,13 +499,13 @@ pub fn run(cli: Cli, backend: &str) -> Result<()> {
         serde_json::to_writer_pretty(&mut out_writer, &out_obj)?;
         writeln!(out_writer)?;
     } else {
-        for (i, r) in results.into_iter().enumerate() {
+        for (i, r) in results.iter().enumerate() {
             let mut out_obj = serde_json::Map::new();
             if let Some(id) = &records[i].id {
                 out_obj.insert(cli.id_field.clone(), id.clone());
             }
             out_obj.insert(cli.text_field.clone(), json!(records[i].text));
-            out_obj.insert("result".into(), r);
+            out_obj.insert("result".into(), r.clone());
             serde_json::to_writer(&mut out_writer, &out_obj)?;
             writeln!(out_writer)?;
         }
@@ -319,68 +514,81 @@ pub fn run(cli: Cli, backend: &str) -> Result<()> {
     Ok(())
 }
 
-fn gather_records(input: &str, cli: &Cli) -> Result<Vec<Record>> {
-    let mut records = Vec::new();
-    let (mut reader, path_is_jsonl, path_is_json) = if input == "-" {
-        (
-            Box::new(io::BufReader::new(io::stdin())) as Box<dyn BufRead>,
-            true,
-            false,
-        )
-    } else {
-        let path = Path::new(input);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_jsonl = ext == "jsonl";
-        let is_json = ext == "json";
-        let file = fs::File::open(path)?;
-        (
-            Box::new(io::BufReader::new(file)) as Box<dyn BufRead>,
-            is_jsonl,
-            is_json,
-        )
-    };
+const PARQUET_BATCH_SIZE: usize = 8192;
 
-    if path_is_json {
-        let val: Value = serde_json::from_reader(reader)?;
-        if let Some(arr) = val.as_array() {
-            for v in arr {
-                records.push(val_to_record(v, cli)?);
-            }
-        } else {
-            records.push(val_to_record(&val, cli)?);
-        }
-    } else if path_is_jsonl {
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let val: Value = serde_json::from_str(&line)?;
-            records.push(val_to_record(&val, cli)?);
-        }
-    } else {
-        // Plain text
-        if cli.text_split == "line" {
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                records.push(Record {
-                    id: None,
-                    text: line,
-                });
-            }
-        } else {
-            let mut content = String::new();
-            reader.read_to_string(&mut content)?;
-            records.push(Record {
-                id: None,
-                text: content,
-            });
-        }
+fn write_parquet_output(
+    path: &Path,
+    records: &[Record],
+    results: &[Value],
+    cli: &Cli,
+) -> Result<()> {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(&cli.id_field, DataType::Utf8, true),
+        Field::new(&cli.text_field, DataType::Utf8, false),
+        Field::new("result", DataType::Utf8, false),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    for chunk_start in (0..records.len()).step_by(PARQUET_BATCH_SIZE) {
+        let chunk_end = (chunk_start + PARQUET_BATCH_SIZE).min(records.len());
+        let chunk_records = &records[chunk_start..chunk_end];
+        let chunk_results = &results[chunk_start..chunk_end];
+
+        let ids: StringArray = chunk_records
+            .iter()
+            .map(|r| {
+                r.id.as_ref().map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            })
+            .collect();
+
+        let texts: StringArray = chunk_records
+            .iter()
+            .map(|r| Some(r.text.as_str()))
+            .collect();
+
+        let result_strings: StringArray = chunk_results
+            .iter()
+            .map(|r| Some(serde_json::to_string(r).unwrap_or_default()))
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(texts), Arc::new(result_strings)],
+        )?;
+
+        writer.write(&batch)?;
     }
 
+    writer.close()?;
+    Ok(())
+}
+
+fn read_jsonl(reader: impl BufRead, cli: &Cli) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: Value = serde_json::from_str(&line)?;
+        records.push(val_to_record(&val, cli)?);
+    }
     Ok(records)
 }
 
@@ -393,6 +601,54 @@ fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
         .to_string();
     let id = obj.get(&cli.id_field).cloned();
     Ok(Record { id, text })
+}
+
+fn read_parquet_records(path: &Path, cli: &Cli) -> Result<Vec<Record>> {
+    use arrow_array::Array;
+
+    let file = fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut records = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let schema = batch.schema();
+        let text_idx = schema.index_of(&cli.text_field).map_err(|_| {
+            anyhow::anyhow!("Column {:?} not found in parquet file", cli.text_field)
+        })?;
+        let id_idx = schema.index_of(&cli.id_field).ok();
+
+        let text_col = batch
+            .column(text_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .context(format!(
+                "Column {:?} is not a string column",
+                cli.text_field
+            ))?;
+
+        let id_col = id_idx.map(|idx| batch.column(idx));
+
+        for row in 0..batch.num_rows() {
+            let text = text_col.value(row).to_string();
+            let id = id_col.and_then(|col| {
+                let any = col.as_any();
+                any.downcast_ref::<arrow_array::StringArray>()
+                    .map(|s| json!(s.value(row)))
+                    .or_else(|| {
+                        any.downcast_ref::<arrow_array::Int64Array>()
+                            .map(|i| json!(i.value(row)))
+                    })
+                    .or_else(|| {
+                        any.downcast_ref::<arrow_array::Int32Array>()
+                            .map(|i| json!(i.value(row)))
+                    })
+            });
+            records.push(Record { id, text });
+        }
+    }
+    Ok(records)
 }
 
 fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, crate::schema::ExtractionMetadata)> {
