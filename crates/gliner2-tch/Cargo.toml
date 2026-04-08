@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-gliner2 = { workspace = true, features = ["tch"] }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+anyhow.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
+gliner2.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
 
 [features]
 default = []
