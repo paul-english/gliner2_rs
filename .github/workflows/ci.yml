@@ -33,20 +33,11 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (candle)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: cargo clippy (tch)
-        run: cargo clippy -p gliner2 --all-targets --features tch,download-libtorch -- -D warnings
-
-      - name: cargo clippy (gliner2-tch crate)
-        run: cargo clippy -p gliner2-tch --all-targets --features download-libtorch -- -D warnings
-
-      - name: cargo test (candle)
-        run: cargo test --workspace
-
-      - name: cargo test (tch)
-        run: cargo test -p gliner2 --features tch,download-libtorch
+      - name: cargo test
+        run: cargo test --workspace --all-targets --all-features
 
   harness:
     runs-on: ubuntu-latest
@@ -76,6 +67,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+          GLINER2_BENCH_TCH: 1
         run: bash harness/run_all.sh
 
       - name: Multitask harness (Rust vs Python)
@@ -83,6 +75,8 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: bash harness/run_multitask.sh
+
+      # TODO tch-rs vs python as well
 
   coverage:
     runs-on: ubuntu-latest
@@ -96,7 +90,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: cargo llvm-cov (workspace LCOV)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --all-features
 
       - name: Upload LCOV artifact
         uses: actions/upload-artifact@v4
