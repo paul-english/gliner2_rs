@@ -11,11 +11,18 @@ This project implements the [Gliner2](https://github.com/fastino-ai/GLiNER2) mod
 
 ```bash
 cargo add gliner2
+
 # and/or for a cli utility
 cargo install gliner2
+gliner2 setup # allows configuring candle,tch; device (cuda, rocm, cpu)
+
+# Directy run with tch-rs
 # LibTorch encoder for the example binary: cargo install gliner2 --features tch
 # then: gliner2 --backend tch   (or GLINER2_BACKEND=tch)
 ```
+
+If you're using an accelerator
+- CUDA: libtorch for CUDA requires the [nvidia container toolkit]().
 
 ## Code coverage
 
