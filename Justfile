@@ -28,10 +28,11 @@ test *ARGS:
 
 bench:
     export GLINER2_BENCH_TCH=1
-    LIBTORCH={{libtorch}} harness/run_all.sh
-    LIBTORCH={{libtorch}} harness/run_compare_all.sh
-    LIBTORCH={{libtorch}} harness/run_multitask.sh
-    LIBTORCH={{libtorch}} harness/r un_python.sh
-    LIBTORCH={{libtorch}} harness/run_throughput.sh
+    export LIBTORCH={{libtorch}}
+    harness/run_all.sh
+    harness/run_compare_all.sh
+    harness/run_multitask.sh
+    harness/r un_python.sh
+    harness/run_throughput.sh
 
 ci: fmt clippy test

@@ -20,7 +20,7 @@ tch-backend = ["gliner2/tch", "dep:tch"]
 download-libtorch = ["gliner2/download-libtorch", "tch?/download-libtorch"]
 
 [dependencies]
-gliner2.workspace = true
+gliner2 = { workspace = true, features = ["candle"] }
 tch = { version = "0.24", optional = true }
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
