@@ -41,3 +41,7 @@ Commands:
 Tickets stored as markdown files in .tickets/
 Supports partial ID matching (e.g., 'tk show 5c4' matches 'nw-5c46')
 ```
+
+---
+
+Use `just` to run things, it ties together a lot of config nuance
