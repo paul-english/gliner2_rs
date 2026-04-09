@@ -1,5 +1,5 @@
 # Build release binaries and upload to GitHub Releases.
-# Triggered on tag push (v*). Each target produces a tarball with bin/gliner2 + bin/gliner2-tch.
+# Triggered on tag push (v*).
 # LibTorch is NOT bundled — users run `gliner2 setup` to download their variant.
 
 name: Release
@@ -28,17 +28,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build gliner2 (candle-only launcher)
+      # TODO build candle, build tch + {cu variants, cpu, rocm}
+      # TORCH_CUDA_VERSION=cu118,cu121,cu124,cu126,cu128
+      - name: Build gliner2
         run: cargo build --release -p gliner2 --target ${{ matrix.target }}
-
-      - name: Build gliner2-tch (LibTorch engine)
-        run: cargo build --release -p gliner2-tch --features download-libtorch --target ${{ matrix.target }}
 
       - name: Package tarball
         run: |
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/gliner2 dist/bin/
-          cp target/${{ matrix.target }}/release/gliner2-tch dist/bin/
           tar -czf gliner2-${{ matrix.target }}.tar.gz -C dist .
 
       - name: Upload release asset

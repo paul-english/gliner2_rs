@@ -172,7 +172,6 @@ pub fn run_setup(
                 let cfg = make_tch_config(&variant, &lib_path);
                 save_config(&cfg)?;
                 eprintln!("Configuration saved.");
-                check_tch_binary();
                 return Ok(());
             }
         }
@@ -212,8 +211,6 @@ pub fn run_setup(
     let cfg = make_tch_config(&variant, &lib_path);
     save_config(&cfg)?;
     eprintln!("\nConfiguration saved to {}", config_path()?.display());
-
-    check_tch_binary();
 
     eprintln!(
         "\nSetup complete. Use `gliner2 --backend tch <command>` or set the default in config."
@@ -350,29 +347,4 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn check_tch_binary() {
-    // Check if gliner2-tch is available
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    let found = exe_dir
-        .as_ref()
-        .map(|d| d.join("gliner2-tch").exists())
-        .unwrap_or(false)
-        || which_in_path("gliner2-tch");
-
-    if !found {
-        eprintln!("\nNote: gliner2-tch binary not found on PATH or next to this binary.");
-        eprintln!("Install it with: cargo binstall gliner2-tch");
-        eprintln!("  or: cargo install gliner2-tch");
-    }
-}
-
-fn which_in_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).exists()))
-        .unwrap_or(false)
 }

@@ -1,24 +1,107 @@
-use anyhow::Result;
+#[cfg(feature = "candle")]
+use gliner2::CandleExtractor;
+use gliner2::config::{ModelFiles, download_model};
+use gliner2::{
+    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract,
+    infer_metadata_from_schema,
+};
+#[cfg(feature = "tch")]
+use gliner2::{TchExtractor, parse_tch_device};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use gliner2::cli;
-use std::path::PathBuf;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde_json::{Value, json};
+use std::fs;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
 
-/// Launcher-only subcommands (setup, status). Inference commands are handled
-/// by the full `cli::Cli` parser when these don't match.
 #[derive(Parser)]
-#[command(
-    name = "gliner2",
-    version,
-    about = "Gliner2 CLI",
-    disable_help_subcommand = true
-)]
-struct LauncherCli {
+#[command(name = "gliner2", version, about = "Gliner2 CLI")]
+struct Cli {
     #[command(subcommand)]
-    command: Option<LauncherCommands>,
+    command: Commands,
+
+    /// Hugging Face model id
+    #[arg(long, default_value = "fastino/gliner2-base-v1", global = true)]
+    model: String,
+
+    /// Offline layout directory
+    #[arg(long, global = true)]
+    model_dir: Option<PathBuf>,
+
+    /// Explicit path to config.json
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Explicit path to encoder_config/config.json
+    #[arg(long, global = true)]
+    encoder_config: Option<PathBuf>,
+
+    /// Explicit path to tokenizer.json
+    #[arg(long, global = true)]
+    tokenizer: Option<PathBuf>,
+
+    /// Explicit path to model.safetensors
+    #[arg(long, global = true)]
+    weights: Option<PathBuf>,
+
+    /// Backend (candle or tch)
+    #[arg(long, env = "GLINER2_BACKEND", global = true)]
+    backend: Option<String>,
+
+    /// LibTorch device when using `--backend tch` (ignored for candle): cpu, cuda, cuda:N, mps, vulkan, auto.
+    #[arg(long, env = "GLINER2_DEVICE", default_value = "cpu", global = true)]
+    device: String,
+
+    /// Log level (off, error, warn, info, debug, trace)
+    #[arg(long, default_value = "info", global = true)]
+    log_level: String,
+
+    // Inference flags
+    #[arg(long, default_value_t = 0.5, global = true)]
+    threshold: f32,
+
+    #[arg(long, global = true)]
+    max_len: Option<usize>,
+
+    #[arg(long, global = true)]
+    include_confidence: bool,
+
+    #[arg(long, global = true)]
+    include_spans: bool,
+
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    format_results: bool,
+
+    #[arg(long, global = true)]
+    raw: bool,
+
+    #[arg(long, default_value_t = 8, global = true)]
+    batch_size: usize,
+
+    /// Field containing document text in JSON / JSONL records
+    #[arg(long, default_value = "text", global = true)]
+    text_field: String,
+
+    /// Field to pass through as record id when present
+    #[arg(long, default_value = "id", global = true)]
+    id_field: String,
+
+    /// Plain text: full (whole file) or line (one record per non-empty line)
+    #[arg(long, default_value = "full", global = true)]
+    text_split: String,
+
+    /// Output path (default: stdout)
+    #[arg(short, long, global = true)]
+    output: Option<PathBuf>,
+
+    /// Pretty-print JSON (only if output can be buffered)
+    #[arg(long, global = true)]
+    pretty: bool,
 }
 
 #[derive(Subcommand)]
-enum LauncherCommands {
+enum Commands {
     /// Configure backend and download libtorch
     Setup {
         /// Skip interactive prompts
@@ -33,41 +116,91 @@ enum LauncherCommands {
     },
     /// Show current configuration and backend status
     Status,
+    /// Named-entity extraction
+    Entities {
+        /// Repeatable entity type name
+        #[arg(long)]
+        label: Vec<String>,
+        /// JSON array of names or object form (name -> description)
+        #[arg(long)]
+        labels_json: Option<PathBuf>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Text classification
+    Classify {
+        /// Required classification task name
+        #[arg(long)]
+        task: String,
+        /// Repeatable class label
+        #[arg(long)]
+        label: Vec<String>,
+        /// Array of labels or object (label -> description)
+        #[arg(long)]
+        labels_json: Option<PathBuf>,
+        /// Multi-label classification
+        #[arg(long)]
+        multi_label: bool,
+        /// Per-task classifier threshold
+        #[arg(long, default_value_t = 0.5)]
+        cls_threshold: f32,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Relation extraction
+    Relations {
+        /// Repeatable relation type name
+        #[arg(long)]
+        relation: Vec<String>,
+        /// JSON array of names or object form
+        #[arg(long)]
+        relations_json: Option<PathBuf>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Structured JSON / field extraction
+    Json {
+        /// JSON file: object mapping structure name -> array of field specs
+        #[arg(long)]
+        structures: Option<PathBuf>,
+        /// Same object inline
+        #[arg(long)]
+        structures_json: Option<String>,
+        /// Input file or "-" for stdin
+        input: String,
+    },
+    /// Multitask: full engine schema in one pass
+    Run {
+        /// Full engine multitask schema
+        #[arg(long)]
+        schema_file: PathBuf,
+        /// Input file or "-" for stdin
+        input: String,
+    },
 }
 
 fn main() -> Result<()> {
-    // Two-phase parse: try launcher commands first, then fall through to full inference CLI.
-    // We check the raw args to avoid clap errors on inference subcommands like "entities".
-    let first_positional = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+    let cli = Cli::parse();
 
-    match first_positional.as_deref() {
-        Some("setup") => {
-            let launcher = LauncherCli::parse();
-            if let Some(LauncherCommands::Setup {
-                non_interactive,
-                backend,
-                variant,
-            }) = launcher.command
-            {
-                return gliner2::setup::run_setup(
-                    non_interactive,
-                    backend.as_deref(),
-                    variant.as_deref(),
-                );
-            }
-            unreachable!();
+    match cli.command {
+        Commands::Setup {
+            non_interactive,
+            ref backend,
+            ref variant,
+        } => {
+            gliner2::setup::run_setup(non_interactive, backend.as_deref(), variant.as_deref())
         }
-        Some("status") => {
-            return show_status();
+        Commands::Status => show_status(),
+        _ => {
+            let backend = resolve_backend(&cli);
+            init_tracing(&cli.log_level);
+            run(cli, &backend)
         }
-        _ => {}
     }
+}
 
-    // Inference path: parse with the full CLI struct.
-    let cli_args = cli::Cli::parse();
-
-    // Resolve backend: --backend flag > GLINER2_BACKEND env > config.toml > "candle"
-    let backend = match &cli_args.backend {
+fn resolve_backend(cli: &Cli) -> String {
+    match &cli.backend {
         Some(b) => b.clone(),
         None => {
             if let Ok(Some(cfg)) = gliner2::setup::load_config() {
@@ -76,23 +209,7 @@ fn main() -> Result<()> {
                 "candle".to_string()
             }
         }
-    };
-
-    init_tracing(&cli_args.log_level);
-
-    if backend == "tch" {
-        #[cfg(feature = "tch")]
-        {
-            return cli::run(cli_args, &backend);
-        }
-
-        #[cfg(not(feature = "tch"))]
-        {
-            return exec_tch_binary();
-        }
     }
-
-    cli::run(cli_args, &backend)
 }
 
 fn init_tracing(log_level: &str) {
@@ -115,14 +232,7 @@ fn show_status() -> Result<()> {
     eprintln!("gliner2 status\n");
     eprintln!("Compiled backends:");
     eprintln!("  candle: {}", if candle_available { "yes" } else { "no" });
-    eprintln!(
-        "  tch:    {}",
-        if tch_compiled {
-            "yes (compiled-in)"
-        } else {
-            "no (uses gliner2-tch binary)"
-        }
-    );
+    eprintln!("  tch:    {}", if tch_compiled { "yes" } else { "no" });
 
     match gliner2::setup::load_config()? {
         Some(cfg) => {
@@ -148,103 +258,592 @@ fn show_status() -> Result<()> {
         }
     }
 
-    if !tch_compiled {
-        let found = find_tch_binary().is_some();
-        eprintln!(
-            "\ngliner2-tch binary: {}",
-            if found {
-                "found"
-            } else {
-                "not found — install with `cargo binstall gliner2-tch`"
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Input / Output / Engine types
+// ---------------------------------------------------------------------------
+
+struct Record {
+    id: Option<Value>,
+    text: String,
+}
+
+enum Input {
+    Stdin, // FIXME needs to be easily converted to StreamingRecord
+    Json(PathBuf),
+    Jsonl(PathBuf),
+    Parquet(PathBuf),
+    ParquetGlob(Vec<PathBuf>),
+    PlainText(String),
+    JsonText(String),
+}
+
+enum Output {
+    Jsonl,
+    Parquet(PathBuf),
+}
+
+impl Output {
+    fn resolve(input: &Input, cli: &Cli) -> Self {
+        let is_parquet_input = matches!(input, Input::Parquet(_) | Input::ParquetGlob(_));
+        if is_parquet_input {
+            if let Some(ref path) = cli.output {
+                if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                    return Output::Parquet(path.clone());
+                }
+                if path.is_dir() || !path.to_string_lossy().contains('.') {
+                    return Output::Parquet(path.clone());
+                }
             }
-        );
+        }
+        Output::Jsonl
+    }
+}
+
+impl Input {
+    fn parse(s: &str) -> Result<Self> {
+        if s == "-" {
+            return Ok(Input::Stdin);
+        }
+        // Check for glob patterns
+        if s.contains('*') || s.contains('?') {
+            let mut paths: Vec<PathBuf> = glob::glob(s)
+                .map_err(|e| anyhow::anyhow!("Invalid glob pattern: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if paths.is_empty() {
+                anyhow::bail!("No files matched glob pattern: {s}");
+            }
+            paths.sort();
+            if paths
+                .iter()
+                .all(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet"))
+            {
+                return Ok(Input::ParquetGlob(paths));
+            }
+            anyhow::bail!(
+                "Glob pattern matched non-parquet files; glob input is only supported for .parquet files"
+            );
+        }
+        let path = Path::new(s);
+        Ok(match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => Input::Json(path.to_path_buf()),
+            Some("jsonl") => Input::Jsonl(path.to_path_buf()),
+            Some("parquet") => Input::Parquet(path.to_path_buf()),
+            Some("txt") | Some("md") => {
+                Input::PlainText(fs::read_to_string(path).unwrap_or_else(|_| s.to_string()))
+            }
+            _ => {
+                if path.exists() {
+                    Input::PlainText(fs::read_to_string(path).unwrap_or_else(|_| s.to_string()))
+                } else if s.starts_with('{') || s.starts_with('[') {
+                    Input::JsonText(s.to_string())
+                } else {
+                    Input::PlainText(s.to_string())
+                }
+            }
+        })
+    }
+
+    /// Bail if a `.jsonl` file is actually a JSON array.
+    fn validate_jsonl(path: &Path) -> Result<()> {
+        let file = fs::File::open(path)?;
+        let mut reader = io::BufReader::new(file);
+        let mut buf = [0u8; 1];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {
+                    if buf[0].is_ascii_whitespace() {
+                        continue;
+                    }
+                    if buf[0] == b'[' {
+                        anyhow::bail!(
+                            "{}: file starts with '[' (JSON array), but has .jsonl extension.\n\
+                             JSONL files must have one JSON object per line.\n\
+                             Rename to .json to treat as a JSON array.",
+                            path.display()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn iter_records(self, cli: &Cli) -> Result<Vec<Record>> {
+        match self {
+            Input::Parquet(path) => read_parquet_records(&path, cli),
+            Input::ParquetGlob(paths) => {
+                let mut records = Vec::new();
+                for path in &paths {
+                    records.extend(read_parquet_records(path, cli)?);
+                }
+                Ok(records)
+            }
+            Input::Json(path) => {
+                let val: Value =
+                    serde_json::from_reader(io::BufReader::new(fs::File::open(&path)?))?;
+                if let Some(arr) = val.as_array() {
+                    arr.iter().map(|v| val_to_record(v, cli)).collect()
+                } else {
+                    Ok(vec![val_to_record(&val, cli)?])
+                }
+            }
+            Input::Jsonl(path) => {
+                Self::validate_jsonl(&path)?;
+                read_jsonl(io::BufReader::new(fs::File::open(&path)?), cli)
+            }
+            Input::Stdin => read_jsonl(io::BufReader::new(io::stdin()), cli),
+            Input::JsonText(text) => {
+                let val: Value = serde_json::from_str(&text)?;
+                if let Some(arr) = val.as_array() {
+                    arr.iter().map(|v| val_to_record(v, cli)).collect()
+                } else {
+                    Ok(vec![val_to_record(&val, cli)?])
+                }
+            }
+            Input::PlainText(text) => {
+                if cli.text_split == "line" {
+                    Ok(text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| Record {
+                            id: None,
+                            text: l.to_string(),
+                        })
+                        .collect())
+                } else {
+                    Ok(vec![Record { id: None, text }])
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Engine {
+    #[cfg(feature = "candle")]
+    Candle(CandleExtractor),
+    #[cfg(feature = "tch")]
+    Tch(TchExtractor),
+}
+
+// ---------------------------------------------------------------------------
+// Inference
+// ---------------------------------------------------------------------------
+
+fn resolve_model_files(cli: &Cli) -> Result<ModelFiles> {
+    if let Some(dir) = &cli.model_dir {
+        return Ok(ModelFiles {
+            config: dir.join("config.json"),
+            encoder_config: dir.join("encoder_config/config.json"),
+            tokenizer: dir.join("tokenizer.json"),
+            weights: dir.join("model.safetensors"),
+        });
+    }
+
+    if let (Some(c), Some(e), Some(t), Some(w)) = (
+        &cli.config,
+        &cli.encoder_config,
+        &cli.tokenizer,
+        &cli.weights,
+    ) {
+        return Ok(ModelFiles {
+            config: c.clone(),
+            encoder_config: e.clone(),
+            tokenizer: t.clone(),
+            weights: w.clone(),
+        });
+    }
+
+    download_model(&cli.model)
+}
+
+fn run(cli: Cli, backend: &str) -> Result<()> {
+    let files = resolve_model_files(&cli)?;
+
+    let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
+
+    let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
+    let vocab = processor.tokenizer.get_vocab_size(true);
+
+    let engine = if backend == "tch" {
+        #[cfg(feature = "tch")]
+        {
+            let dev = parse_tch_device(&cli.device)?;
+            Engine::Tch(TchExtractor::load(&files, config, vocab, dev)?)
+        }
+        #[cfg(not(feature = "tch"))]
+        {
+            anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
+        }
+    } else {
+        #[cfg(feature = "candle")]
+        {
+            Engine::Candle(CandleExtractor::load_cpu(&files, config, vocab)?)
+        }
+        #[cfg(not(feature = "candle"))]
+        {
+            anyhow::bail!("Backend \"candle\" requires the default `candle` feature");
+        }
+    };
+
+    let input_path = match &cli.command {
+        Commands::Entities { input, .. } => input,
+        Commands::Classify { input, .. } => input,
+        Commands::Relations { input, .. } => input,
+        Commands::Json { input, .. } => input,
+        Commands::Run { input, .. } => input,
+        Commands::Setup { .. } | Commands::Status => unreachable!(),
+    };
+
+    let input = Input::parse(input_path)?;
+    let output_format = Output::resolve(&input, &cli);
+
+    let (schema, meta) = build_schema_and_meta(&cli.command)?;
+
+    let opts = ExtractOptions {
+        threshold: cli.threshold,
+        format_results: !cli.raw && cli.format_results,
+        include_confidence: cli.include_confidence,
+        include_spans: cli.include_spans,
+        max_len: cli.max_len,
+        batch_size: cli.batch_size,
+    };
+
+    // Multi-file parquet: process each file independently
+    if let Input::ParquetGlob(ref paths) = input {
+        if let Output::Parquet(ref out_dir) = output_format {
+            fs::create_dir_all(out_dir)?;
+            for in_path in paths {
+                let records = read_parquet_records(in_path, &cli)?;
+                if records.is_empty() {
+                    continue;
+                }
+                let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+                let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
+                let out_path =
+                    out_dir.join(in_path.file_name().context("input file has no filename")?);
+                write_parquet_output(&out_path, &records, &results, &cli)?;
+            }
+            return Ok(());
+        }
+    }
+
+    // Single-input path (or JSONL output for any input)
+    let records = input.iter_records(&cli)?;
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+    let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
+
+    match output_format {
+        Output::Parquet(ref path) => {
+            write_parquet_output(path, &records, &results, &cli)?;
+        }
+        Output::Jsonl => {
+            write_jsonl_output(&records, &results, &cli)?;
+        }
     }
 
     Ok(())
 }
 
-/// Find the gliner2-tch binary: same directory as current exe, then PATH.
-fn find_tch_binary() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("gliner2-tch");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
+fn run_extract(
+    engine: &Engine,
+    processor: &SchemaTransformer,
+    texts: &[String],
+    schema: &Value,
+    meta: &gliner2::schema::ExtractionMetadata,
+    opts: &ExtractOptions,
+) -> Result<Vec<Value>> {
+    match engine {
+        #[cfg(feature = "candle")]
+        Engine::Candle(e) => batch_extract(
+            e,
+            processor,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+        ),
+        #[cfg(feature = "tch")]
+        Engine::Tch(e) => batch_extract(
+            e,
+            processor,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+        ),
+        #[cfg(not(any(feature = "candle", feature = "tch")))]
+        _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
     }
-
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("gliner2-tch");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
 }
 
-#[cfg(not(feature = "tch"))]
-fn exec_tch_binary() -> Result<()> {
-    let config = gliner2::setup::load_config()?;
-    let lib_path = config
-        .as_ref()
-        .and_then(|c| c.tch.as_ref())
-        .map(|t| t.lib_path.clone());
+// ---------------------------------------------------------------------------
+// Output writers
+// ---------------------------------------------------------------------------
 
-    let lib_path = match lib_path {
-        Some(lp) if lp.exists() => lp,
-        _ => {
-            anyhow::bail!(
-                "LibTorch not configured. Run `gliner2 setup` to download and configure LibTorch."
-            );
+fn write_jsonl_output(records: &[Record], results: &[Value], cli: &Cli) -> Result<()> {
+    let mut out_writer: Box<dyn io::Write> = if let Some(path) = &cli.output {
+        Box::new(fs::File::create(path)?)
+    } else {
+        Box::new(io::stdout())
+    };
+
+    if cli.pretty && results.len() == 1 {
+        let r = &results[0];
+        let mut out_obj = serde_json::Map::new();
+        if let Some(id) = &records[0].id {
+            out_obj.insert(cli.id_field.clone(), id.clone());
         }
-    };
-
-    let tch_bin = find_tch_binary().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Backend \"tch\" requested but gliner2-tch binary not found.\n\
-             Install it with: cargo binstall gliner2-tch\n\
-             For development, use: just run-tch <args>"
-        )
-    })?;
-
-    let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let new_ld = if existing.is_empty() {
-        lib_path.to_string_lossy().to_string()
+        out_obj.insert(cli.text_field.clone(), json!(records[0].text));
+        out_obj.insert("result".into(), r.clone());
+        serde_json::to_writer_pretty(&mut out_writer, &out_obj)?;
+        writeln!(out_writer)?;
     } else {
-        format!("{}:{existing}", lib_path.display())
-    };
-
-    let existing_dyld = std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default();
-    let new_dyld = if existing_dyld.is_empty() {
-        lib_path.to_string_lossy().to_string()
-    } else {
-        format!("{}:{existing_dyld}", lib_path.display())
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&tch_bin)
-            .args(&args)
-            .env("LD_LIBRARY_PATH", &new_ld)
-            .env("DYLD_LIBRARY_PATH", &new_dyld)
-            .exec();
-        anyhow::bail!("Failed to exec {}: {}", tch_bin.display(), err);
+        for (i, r) in results.iter().enumerate() {
+            let mut out_obj = serde_json::Map::new();
+            if let Some(id) = &records[i].id {
+                out_obj.insert(cli.id_field.clone(), id.clone());
+            }
+            out_obj.insert(cli.text_field.clone(), json!(records[i].text));
+            out_obj.insert("result".into(), r.clone());
+            serde_json::to_writer(&mut out_writer, &out_obj)?;
+            writeln!(out_writer)?;
+        }
     }
 
-    #[cfg(not(unix))]
-    {
-        let status = std::process::Command::new(&tch_bin)
-            .args(&args)
-            .env("LD_LIBRARY_PATH", &new_ld)
-            .env("DYLD_LIBRARY_PATH", &new_dyld)
-            .status()?;
-        std::process::exit(status.code().unwrap_or(1));
+    Ok(())
+}
+
+const PARQUET_BATCH_SIZE: usize = 8192;
+
+fn write_parquet_output(
+    path: &Path,
+    records: &[Record],
+    results: &[Value],
+    cli: &Cli,
+) -> Result<()> {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(&cli.id_field, DataType::Utf8, true),
+        Field::new(&cli.text_field, DataType::Utf8, false),
+        Field::new("result", DataType::Utf8, false),
+    ]));
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+
+    let file = fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+
+    for chunk_start in (0..records.len()).step_by(PARQUET_BATCH_SIZE) {
+        let chunk_end = (chunk_start + PARQUET_BATCH_SIZE).min(records.len());
+        let chunk_records = &records[chunk_start..chunk_end];
+        let chunk_results = &results[chunk_start..chunk_end];
+
+        let ids: StringArray = chunk_records
+            .iter()
+            .map(|r| {
+                r.id.as_ref().map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            })
+            .collect();
+
+        let texts: StringArray = chunk_records
+            .iter()
+            .map(|r| Some(r.text.as_str()))
+            .collect();
+
+        let result_strings: StringArray = chunk_results
+            .iter()
+            .map(|r| Some(serde_json::to_string(r).unwrap_or_default()))
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(texts), Arc::new(result_strings)],
+        )?;
+
+        writer.write(&batch)?;
     }
+
+    writer.close()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Input readers
+// ---------------------------------------------------------------------------
+
+fn read_jsonl(reader: impl BufRead, cli: &Cli) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let val: Value = serde_json::from_str(&line)?;
+        records.push(val_to_record(&val, cli)?);
+    }
+    Ok(records)
+}
+
+fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
+    let obj = v.as_object().context("Expected JSON object for record")?;
+    let text = obj
+        .get(&cli.text_field)
+        .and_then(|t| t.as_str())
+        .context(format!("Missing text field {:?} in record", cli.text_field))?
+        .to_string();
+    let id = obj.get(&cli.id_field).cloned();
+    Ok(Record { id, text })
+}
+
+fn read_parquet_records(path: &Path, cli: &Cli) -> Result<Vec<Record>> {
+    use arrow_array::Array;
+
+    let file = fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut records = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let schema = batch.schema();
+        let text_idx = schema.index_of(&cli.text_field).map_err(|_| {
+            anyhow::anyhow!("Column {:?} not found in parquet file", cli.text_field)
+        })?;
+        let id_idx = schema.index_of(&cli.id_field).ok();
+
+        let text_col = batch
+            .column(text_idx)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .context(format!(
+                "Column {:?} is not a string column",
+                cli.text_field
+            ))?;
+
+        let id_col = id_idx.map(|idx| batch.column(idx));
+
+        for row in 0..batch.num_rows() {
+            let text = text_col.value(row).to_string();
+            let id = id_col.and_then(|col| {
+                let any = col.as_any();
+                any.downcast_ref::<arrow_array::StringArray>()
+                    .map(|s| json!(s.value(row)))
+                    .or_else(|| {
+                        any.downcast_ref::<arrow_array::Int64Array>()
+                            .map(|i| json!(i.value(row)))
+                    })
+                    .or_else(|| {
+                        any.downcast_ref::<arrow_array::Int32Array>()
+                            .map(|i| json!(i.value(row)))
+                    })
+            });
+            records.push(Record { id, text });
+        }
+    }
+    Ok(records)
+}
+
+// ---------------------------------------------------------------------------
+// Schema building
+// ---------------------------------------------------------------------------
+
+fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::ExtractionMetadata)> {
+    let mut s = gliner2::schema::create_schema();
+    match cmd {
+        Commands::Entities {
+            label, labels_json, ..
+        } => {
+            if !label.is_empty() && labels_json.is_some() {
+                anyhow::bail!("Cannot provide both --label and --labels-json");
+            }
+            if let Some(path) = labels_json {
+                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+                s.entities(v);
+            } else {
+                s.entities(json!(label));
+            }
+        }
+        Commands::Classify {
+            task,
+            label,
+            labels_json,
+            multi_label,
+            cls_threshold,
+            ..
+        } => {
+            if !label.is_empty() && labels_json.is_some() {
+                anyhow::bail!("Cannot provide both --label and --labels-json");
+            }
+            let labels = if let Some(path) = labels_json {
+                serde_json::from_str(&fs::read_to_string(path)?)?
+            } else {
+                json!(label)
+            };
+            s.classification(task, labels, *multi_label, *cls_threshold);
+        }
+        Commands::Relations {
+            relation,
+            relations_json,
+            ..
+        } => {
+            if !relation.is_empty() && relations_json.is_some() {
+                anyhow::bail!("Cannot provide both --relation and --relations-json");
+            }
+            let rels = if let Some(path) = relations_json {
+                serde_json::from_str(&fs::read_to_string(path)?)?
+            } else {
+                json!(relation)
+            };
+            s.relations(rels);
+        }
+        Commands::Json {
+            structures,
+            structures_json,
+            ..
+        } => {
+            if structures.is_some() && structures_json.is_some() {
+                anyhow::bail!("Cannot provide both --structures and --structures-json");
+            }
+            if let Some(path) = structures {
+                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+                let obj = v
+                    .as_object()
+                    .context("--structures must be a JSON object")?;
+                s.extract_json_structures(obj)?;
+            } else if let Some(js) = structures_json {
+                let v: Value = serde_json::from_str(js)?;
+                let obj = v
+                    .as_object()
+                    .context("--structures-json must be a JSON object")?;
+                s.extract_json_structures(obj)?;
+            }
+        }
+        Commands::Run { schema_file, .. } => {
+            let v: Value = serde_json::from_str(&fs::read_to_string(schema_file)?)?;
+            let meta = infer_metadata_from_schema(&v);
+            return Ok((v, meta));
+        }
+        Commands::Setup { .. } | Commands::Status => unreachable!(),
+    }
+    Ok(s.build())
 }

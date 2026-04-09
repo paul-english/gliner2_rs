@@ -16,9 +16,13 @@ cargo add gliner2
 cargo install gliner2
 gliner2 setup # allows configuring candle,tch; device (cuda, rocm, cpu)
 
-# Directy run with tch-rs
-# LibTorch encoder for the example binary: cargo install gliner2 --features tch
-# then: gliner2 --backend tch   (or GLINER2_BACKEND=tch)
+# Run with tch-rs
+# LibTorch encoder for the example binary: 
+cargo install gliner2 --features tch
+gliner2 --backend tch # (or GLINER2_BACKEND=tch)
+
+# Quick, has both tch & candle backends
+cargo binstall gliner2
 ```
 
 If you're using an accelerator

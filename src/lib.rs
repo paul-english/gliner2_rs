@@ -1,5 +1,4 @@
 pub mod backends;
-pub mod cli;
 pub mod config;
 pub mod decode;
 pub mod engine;
