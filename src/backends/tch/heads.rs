@@ -208,7 +208,7 @@ impl GrucellT {
 pub(crate) struct TchCountLstm {
     pos_embedding: Tensor,
     gru: GrucellT,
-    projector: TchMlp3,
+    projector: TchMlp2,
     max_count: usize,
 }
 
@@ -224,7 +224,7 @@ impl TchCountLstm {
             .with_context(|| format!("{prefix}.pos_embedding.weight"))?
             .shallow_clone();
         let gru = GrucellT::from_map(map, &format!("{prefix}.gru"), hidden as i64, hidden as i64)?;
-        let projector = TchMlp3::from_map(map, &format!("{prefix}.projector"))?;
+        let projector = TchMlp2::from_map(map, &format!("{prefix}.projector"))?;
         Ok(Self {
             pos_embedding: emb,
             gru,

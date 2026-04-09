@@ -8,7 +8,7 @@ pub struct ExtractorConfig {
     pub model_name: String,
     pub max_width: usize,
     pub counting_layer: String,
-    pub token_pooling: String,
+    pub token_pooling: Option<String>,
     pub max_len: Option<usize>,
 }
 
@@ -18,7 +18,7 @@ impl Default for ExtractorConfig {
             model_name: "microsoft/deberta-v3-base".to_string(),
             max_width: 8,
             counting_layer: "count_lstm".to_string(),
-            token_pooling: "first".to_string(),
+            token_pooling: None,
             max_len: None,
         }
     }
