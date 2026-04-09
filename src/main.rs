@@ -1,3 +1,5 @@
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 #[cfg(feature = "candle")]
 use gliner2::CandleExtractor;
 use gliner2::config::{ModelFiles, download_model};
@@ -7,8 +9,6 @@ use gliner2::{
 };
 #[cfg(feature = "tch")]
 use gliner2::{TchExtractor, parse_tch_device};
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
 use std::fs;
@@ -187,9 +187,7 @@ fn main() -> Result<()> {
             non_interactive,
             ref backend,
             ref variant,
-        } => {
-            gliner2::setup::run_setup(non_interactive, backend.as_deref(), variant.as_deref())
-        }
+        } => gliner2::setup::run_setup(non_interactive, backend.as_deref(), variant.as_deref()),
         Commands::Status => show_status(),
         _ => {
             let backend = resolve_backend(&cli);

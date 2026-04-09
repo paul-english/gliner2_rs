@@ -17,7 +17,7 @@ cargo install gliner2
 gliner2 setup # allows configuring candle,tch; device (cuda, rocm, cpu)
 
 # Run with tch-rs
-# LibTorch encoder for the example binary: 
+# LibTorch encoder for the example binary:
 cargo install gliner2 --features tch
 gliner2 --backend tch # (or GLINER2_BACKEND=tch)
 
