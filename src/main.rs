@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "candle")]
 use gliner2::CandleExtractor;
-use gliner2::config::{ModelFiles, download_model};
 use gliner2::SchemaInfo;
+use gliner2::config::{ModelFiles, download_model};
 use gliner2::{
     BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract_streaming,
     infer_metadata_from_schema,

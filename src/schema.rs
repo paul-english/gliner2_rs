@@ -892,10 +892,8 @@ impl SchemaInfo {
                                                 _ => ValueDtype::List,
                                             })
                                             .unwrap_or(ValueDtype::List);
-                                        let ch = o
-                                            .get("choices")
-                                            .and_then(|v| v.as_array())
-                                            .map(|a| {
+                                        let ch =
+                                            o.get("choices").and_then(|v| v.as_array()).map(|a| {
                                                 a.iter()
                                                     .filter_map(|v| v.as_str().map(String::from))
                                                     .collect()

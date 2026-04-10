@@ -177,7 +177,12 @@ impl LabelConfig {
             children.push(LabelConfigElement::Choices(Choices {
                 name: cls.task.clone(),
                 to_name: "text".into(),
-                choice: if cls.multi_label { "multiple" } else { "single" }.into(),
+                choice: if cls.multi_label {
+                    "multiple"
+                } else {
+                    "single"
+                }
+                .into(),
                 show_inline: "true".into(),
                 choices: cls
                     .labels
@@ -489,12 +494,7 @@ fn convert_structure(annotations: &mut Vec<Value>, st: &StructureInfo, val: &Val
 // ---------------------------------------------------------------------------
 
 /// Find an existing project by title, or create a new one with the given label config.
-pub fn create_or_get_project(
-    url: &str,
-    api_key: &str,
-    name: &str,
-    config: &str,
-) -> Result<u64> {
+pub fn create_or_get_project(url: &str, api_key: &str, name: &str, config: &str) -> Result<u64> {
     let base = url.trim_end_matches('/');
 
     // Search for existing project with matching title
@@ -545,7 +545,11 @@ pub fn create_or_get_project(
         .and_then(|v| v.as_u64())
         .context("Label Studio project creation response missing 'id'")?;
 
-    tracing::info!(project_id = id, title = name, "Created new Label Studio project");
+    tracing::info!(
+        project_id = id,
+        title = name,
+        "Created new Label Studio project"
+    );
     Ok(id)
 }
 
