@@ -4,15 +4,15 @@ use clap::{Parser, Subcommand};
 use gliner2::CandleExtractor;
 use gliner2::config::{ModelFiles, download_model};
 use gliner2::{
-    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract,
-    infer_metadata_from_schema,
+    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer,
+    batch_extract_streaming, infer_metadata_from_schema,
 };
 #[cfg(feature = "tch")]
 use gliner2::{TchExtractor, parse_tch_device};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -513,7 +513,7 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
         batch_size: cli.batch_size,
     };
 
-    // Multi-file parquet: process each file independently
+    // Multi-file parquet: process each file independently, streaming results
     if let Input::ParquetGlob(ref paths) = input {
         if let Output::Parquet(ref out_dir) = output_format {
             fs::create_dir_all(out_dir)?;
@@ -523,10 +523,21 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
                     continue;
                 }
                 let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
-                let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
                 let out_path =
                     out_dir.join(in_path.file_name().context("input file has no filename")?);
-                write_parquet_output(&out_path, &records, &results, &cli)?;
+                let mut writer = create_parquet_writer(&out_path, &cli)?;
+                run_extract_streaming(
+                    &engine,
+                    &processor,
+                    &texts,
+                    &schema,
+                    &meta,
+                    &opts,
+                    |offset, batch| {
+                        write_parquet_batch(&mut writer, &records[offset..offset + batch.len()], &batch, &cli)
+                    },
+                )?;
+                writer.close()?;
             }
             return Ok(());
         }
@@ -539,44 +550,73 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
     }
 
     let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
-    let results = run_extract(&engine, &processor, &texts, &schema, &meta, &opts)?;
 
     match output_format {
         Output::Parquet(ref path) => {
-            write_parquet_output(path, &records, &results, &cli)?;
+            let mut writer = create_parquet_writer(path, &cli)?;
+            run_extract_streaming(
+                &engine,
+                &processor,
+                &texts,
+                &schema,
+                &meta,
+                &opts,
+                |offset, batch| {
+                    write_parquet_batch(&mut writer, &records[offset..offset + batch.len()], &batch, &cli)
+                },
+            )?;
+            writer.close()?;
         }
         Output::Jsonl => {
-            write_jsonl_output(&records, &results, &cli)?;
+            let mut out_writer = create_jsonl_writer(&cli)?;
+            let use_pretty = cli.pretty && texts.len() == 1;
+            run_extract_streaming(
+                &engine,
+                &processor,
+                &texts,
+                &schema,
+                &meta,
+                &opts,
+                |offset, batch| {
+                    write_jsonl_batch(&mut out_writer, &records[offset..offset + batch.len()], &batch, use_pretty, &cli)
+                },
+            )?;
         }
     }
 
     Ok(())
 }
 
-fn run_extract(
+fn run_extract_streaming<F>(
     engine: &Engine,
     processor: &SchemaTransformer,
     texts: &[String],
     schema: &Value,
     meta: &gliner2::schema::ExtractionMetadata,
     opts: &ExtractOptions,
-) -> Result<Vec<Value>> {
+    on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(usize, Vec<Value>) -> Result<()>,
+{
     match engine {
         #[cfg(feature = "candle")]
-        Engine::Candle(e) => batch_extract(
+        Engine::Candle(e) => batch_extract_streaming(
             e,
             processor,
             texts,
             BatchSchemaMode::Shared { schema, meta },
             opts,
+            on_batch,
         ),
         #[cfg(feature = "tch")]
-        Engine::Tch(e) => batch_extract(
+        Engine::Tch(e) => batch_extract_streaming(
             e,
             processor,
             texts,
             BatchSchemaMode::Shared { schema, meta },
             opts,
+            on_batch,
         ),
         #[cfg(not(any(feature = "candle", feature = "tch")))]
         _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
@@ -584,53 +624,47 @@ fn run_extract(
 }
 
 // ---------------------------------------------------------------------------
-// Output writers
+// Output writers (streaming)
 // ---------------------------------------------------------------------------
 
-fn write_jsonl_output(records: &[Record], results: &[Value], cli: &Cli) -> Result<()> {
-    let mut out_writer: Box<dyn io::Write> = if let Some(path) = &cli.output {
-        Box::new(fs::File::create(path)?)
+fn create_jsonl_writer(cli: &Cli) -> Result<Box<dyn io::Write>> {
+    if let Some(path) = &cli.output {
+        Ok(Box::new(io::BufWriter::new(fs::File::create(path)?)))
     } else {
-        Box::new(io::stdout())
-    };
+        Ok(Box::new(io::BufWriter::new(io::stdout().lock())))
+    }
+}
 
-    if cli.pretty && results.len() == 1 {
-        let r = &results[0];
+fn write_jsonl_batch(
+    writer: &mut Box<dyn io::Write>,
+    records: &[Record],
+    results: &[Value],
+    pretty: bool,
+    cli: &Cli,
+) -> Result<()> {
+    for (i, r) in results.iter().enumerate() {
         let mut out_obj = serde_json::Map::new();
-        if let Some(id) = &records[0].id {
+        if let Some(id) = &records[i].id {
             out_obj.insert(cli.id_field.clone(), id.clone());
         }
-        out_obj.insert(cli.text_field.clone(), json!(records[0].text));
+        out_obj.insert(cli.text_field.clone(), json!(records[i].text));
         out_obj.insert("result".into(), r.clone());
-        serde_json::to_writer_pretty(&mut out_writer, &out_obj)?;
-        writeln!(out_writer)?;
-    } else {
-        for (i, r) in results.iter().enumerate() {
-            let mut out_obj = serde_json::Map::new();
-            if let Some(id) = &records[i].id {
-                out_obj.insert(cli.id_field.clone(), id.clone());
-            }
-            out_obj.insert(cli.text_field.clone(), json!(records[i].text));
-            out_obj.insert("result".into(), r.clone());
-            serde_json::to_writer(&mut out_writer, &out_obj)?;
-            writeln!(out_writer)?;
+        if pretty {
+            serde_json::to_writer_pretty(&mut *writer, &out_obj)?;
+        } else {
+            serde_json::to_writer(&mut *writer, &out_obj)?;
         }
+        writeln!(writer)?;
     }
-
+    writer.flush()?;
     Ok(())
 }
 
-const PARQUET_BATCH_SIZE: usize = 8192;
-
-fn write_parquet_output(
+fn create_parquet_writer(
     path: &Path,
-    records: &[Record],
-    results: &[Value],
     cli: &Cli,
-) -> Result<()> {
-    use arrow_array::{RecordBatch, StringArray};
+) -> Result<parquet::arrow::ArrowWriter<fs::File>> {
     use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
@@ -646,42 +680,52 @@ fn write_parquet_output(
         .build();
 
     let file = fs::File::create(path)?;
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+    Ok(parquet::arrow::ArrowWriter::try_new(
+        file,
+        schema,
+        Some(props),
+    )?)
+}
 
-    for chunk_start in (0..records.len()).step_by(PARQUET_BATCH_SIZE) {
-        let chunk_end = (chunk_start + PARQUET_BATCH_SIZE).min(records.len());
-        let chunk_records = &records[chunk_start..chunk_end];
-        let chunk_results = &results[chunk_start..chunk_end];
+fn write_parquet_batch(
+    writer: &mut parquet::arrow::ArrowWriter<fs::File>,
+    records: &[Record],
+    results: &[Value],
+    cli: &Cli,
+) -> Result<()> {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
-        let ids: StringArray = chunk_records
-            .iter()
-            .map(|r| {
-                r.id.as_ref().map(|v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(&cli.id_field, DataType::Utf8, true),
+        Field::new(&cli.text_field, DataType::Utf8, false),
+        Field::new("result", DataType::Utf8, false),
+    ]));
+
+    let ids: StringArray = records
+        .iter()
+        .map(|r| {
+            r.id.as_ref().map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
             })
-            .collect();
+        })
+        .collect();
 
-        let texts: StringArray = chunk_records
-            .iter()
-            .map(|r| Some(r.text.as_str()))
-            .collect();
+    let texts: StringArray = records.iter().map(|r| Some(r.text.as_str())).collect();
 
-        let result_strings: StringArray = chunk_results
-            .iter()
-            .map(|r| Some(serde_json::to_string(r).unwrap_or_default()))
-            .collect();
+    let result_strings: StringArray = results
+        .iter()
+        .map(|r| Some(serde_json::to_string(r).unwrap_or_default()))
+        .collect();
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(ids), Arc::new(texts), Arc::new(result_strings)],
-        )?;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(ids), Arc::new(texts), Arc::new(result_strings)],
+    )?;
 
-        writer.write(&batch)?;
-    }
-
-    writer.close()?;
+    writer.write(&batch)?;
     Ok(())
 }
 

@@ -20,7 +20,8 @@ pub use backends::tch::TchExtractor;
 pub use backends::tch::parse_tch_device;
 pub use decode::Entity;
 pub use extract::{
-    BatchSchemaMode, ExtractOptions, batch_extract, extract_from_preprocessed, extract_with_schema,
+    BatchSchemaMode, ExtractOptions, batch_extract, batch_extract_streaming,
+    extract_from_preprocessed, extract_with_schema,
 };
 pub use preprocess::{PreprocessedBatch, PreprocessedInput, TaskType, collate_preprocessed};
 pub use processor::SchemaTransformer;

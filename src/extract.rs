@@ -215,17 +215,27 @@ pub fn extract_with_schema<E: Gliner2Engine>(
 }
 
 /// Batch extract with Python `batch_extract` semantics: padded encoder passes, batched span rep, per-sample decode.
-pub fn batch_extract<E: Gliner2Engine>(
+/// Stream extraction results batch-by-batch, calling `on_batch` with
+/// `(global_offset, batch_results)` as each inference batch completes.
+///
+/// This avoids buffering all results in memory and allows the caller to
+/// write output incrementally (e.g. JSONL lines or parquet row groups).
+pub fn batch_extract_streaming<E, F>(
     engine: &E,
     transformer: &SchemaTransformer,
     texts: &[String],
     mode: BatchSchemaMode<'_>,
     opts: &ExtractOptions,
-) -> Result<Vec<Value>> {
+    mut on_batch: F,
+) -> Result<()>
+where
+    E: Gliner2Engine,
+    F: FnMut(usize, Vec<Value>) -> Result<()>,
+{
     use rayon::prelude::*;
 
     if texts.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     match mode {
@@ -247,7 +257,6 @@ pub fn batch_extract<E: Gliner2Engine>(
     }
 
     let bs = opts.batch_size.max(1);
-    let mut all_out = Vec::with_capacity(texts.len());
     let mut base = 0usize;
 
     for chunk in texts.chunks(bs) {
@@ -336,13 +345,35 @@ pub fn batch_extract<E: Gliner2Engine>(
             })
             .collect();
 
+        let mut batch_results = Vec::with_capacity(decoded.len());
         for v in decoded {
-            all_out.push(v?);
+            batch_results.push(v?);
         }
+
+        on_batch(base, batch_results)?;
 
         base += chunk.len();
     }
 
+    Ok(())
+}
+
+/// Collect all extraction results into a `Vec<Value>`.
+///
+/// This is a convenience wrapper around [`batch_extract_streaming`] for
+/// callers that need all results in memory (e.g. for further processing).
+pub fn batch_extract<E: Gliner2Engine>(
+    engine: &E,
+    transformer: &SchemaTransformer,
+    texts: &[String],
+    mode: BatchSchemaMode<'_>,
+    opts: &ExtractOptions,
+) -> Result<Vec<Value>> {
+    let mut all_out = Vec::with_capacity(texts.len());
+    batch_extract_streaming(engine, transformer, texts, mode, opts, |_offset, batch| {
+        all_out.extend(batch);
+        Ok(())
+    })?;
     Ok(all_out)
 }
 
