@@ -11,7 +11,7 @@ build-release: clean
     LIBTORCH={{libtorch}} cargo build --all-targets --release
 
 run *ARGS:
-    LIBTORCH={{libtorch}} cargo run -- {{ARGS}}
+    LIBTORCH={{libtorch}} cargo run -F tch -- {{ARGS}}
 
 clippy:
     LIBTORCH={{libtorch}} cargo clippy --workspace --all-targets -- -D warnings
