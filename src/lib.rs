@@ -20,15 +20,18 @@ pub use backends::tch::TchExtractor;
 pub use backends::tch::parse_tch_device;
 pub use decode::Entity;
 pub use extract::{
-    BatchSchemaMode, ExtractOptions, batch_extract, batch_extract_streaming,
-    extract_from_preprocessed, extract_with_schema,
+    BatchSchemaMode, ExtractOptions, ExtractionOutput, LabelConfidence, TaskValue, batch_extract,
+    batch_extract_streaming, extract_from_preprocessed, extract_with_schema,
 };
+pub use indexmap::IndexMap;
 pub use preprocess::{PreprocessedBatch, PreprocessedInput, TaskType, collate_preprocessed};
 pub use processor::SchemaTransformer;
 pub use schema::{
-    ClassificationTaskInfo, EntityTypeInfo, ExtractionMetadata, ParsedFieldSpec, RegexMatchMode,
-    RegexValidator, RelationTypeInfo, Schema, SchemaInfo, StructureBuilder, StructureFieldInfo,
-    StructureInfo, ValueDtype, create_schema, infer_metadata_from_schema, parse_field_spec,
+    ClassificationLabelsInput, ClassificationTaskInfo, EntityTypeInfo, EntityTypesInput,
+    ExtractionMetadata, ExtractionSchema, FieldSpecSource, ParsedFieldSpec, RegexMatchMode,
+    RegexValidator, RelationTypeInfo, RelationTypesInput, Schema, SchemaDocument, SchemaInfo,
+    StructureBuilder, StructureFieldInfo, StructureInfo, ValueDtype, create_schema,
+    infer_metadata_from_schema, parse_field_spec,
 };
 
 // Compile-time assertions: backends and shared types must be Send+Sync for Rayon parallelism.

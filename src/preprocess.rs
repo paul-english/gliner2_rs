@@ -1,8 +1,9 @@
 //! Multi-task input formatting aligned with `gliner2.processor.SchemaTransformer` (inference).
 
 use crate::processor::SchemaTransformer;
+use crate::schema::{ClassificationExample, ExtractionSchema, FieldDefault, StructureField};
 use anyhow::Result;
-use serde_json::Value;
+use indexmap::IndexMap;
 
 pub const SEP_STRUCT: &str = "[SEP_STRUCT]";
 pub const DESC_TOKEN: &str = "[DESCRIPTION]";
@@ -84,9 +85,9 @@ pub struct PreprocessedInput {
     pub original_text: String,
     pub len_prefix: usize,
     /// Schema with choice fields wrapped like Python after `_wrap_classification_fields`.
-    pub schema_working: Value,
+    pub schema_working: ExtractionSchema,
     /// Original schema (pre-wrap) for decoding metadata.
-    pub schema_original: Value,
+    pub schema_original: ExtractionSchema,
 }
 
 impl SchemaTransformer {
@@ -94,7 +95,7 @@ impl SchemaTransformer {
     pub fn transform_extract(
         &self,
         text: &str,
-        schema: &Value,
+        schema: &ExtractionSchema,
         max_len: Option<usize>,
     ) -> Result<PreprocessedInput> {
         let mut text = text.to_string();
@@ -105,8 +106,7 @@ impl SchemaTransformer {
         }
 
         let schema_original = schema.clone();
-        let mut schema_working: Value = serde_json::from_value(schema.clone())
-            .map_err(|e| anyhow::anyhow!("schema clone: {}", e))?;
+        let mut schema_working = schema.clone();
 
         let prefix = build_classification_prefix(&schema_working);
         if !prefix.is_empty() {
@@ -241,30 +241,19 @@ struct InferredSchemas {
     task_types: Vec<TaskType>,
 }
 
-fn build_classification_prefix(schema: &Value) -> Vec<String> {
+fn build_classification_prefix(schema: &ExtractionSchema) -> Vec<String> {
     let mut prefix_tokens: Vec<String> = Vec::new();
-    let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) else {
-        return prefix_tokens;
-    };
 
-    for st in arr {
-        let Some(obj) = st.as_object() else { continue };
-        for (parent, fields) in obj {
-            let Some(fmap) = fields.as_object() else {
-                continue;
-            };
+    for block in &schema.json_structures {
+        for (parent, fmap) in &block.parents {
             let mut cls_fields: Vec<(String, Vec<String>)> = Vec::new();
             for (fname, fval) in fmap {
-                if let Some(choices) = fval
-                    .get("choices")
-                    .and_then(|c| c.as_array())
-                    .filter(|_| fval.get("value").is_some())
-                {
-                    let ch: Vec<String> = choices
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    cls_fields.push((fname.clone(), ch));
+                if let StructureField::Rich(body) = fval {
+                    if body.value.is_some() {
+                        if let Some(ch) = &body.choices {
+                            cls_fields.push((fname.clone(), ch.clone()));
+                        }
+                    }
                 }
             }
             if cls_fields.is_empty() {
@@ -294,48 +283,30 @@ fn build_classification_prefix(schema: &Value) -> Vec<String> {
     prefix_tokens
 }
 
-fn wrap_classification_fields(schema: &mut Value) {
-    let Some(arr) = schema
-        .get_mut("json_structures")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return;
-    };
-    for st in arr.iter_mut() {
-        let Some(obj) = st.as_object_mut() else {
-            continue;
-        };
-        for (_parent, fields) in obj.iter_mut() {
-            let Some(fmap) = fields.as_object_mut() else {
-                continue;
-            };
+fn wrap_classification_fields(schema: &mut ExtractionSchema) {
+    for block in &mut schema.json_structures {
+        for (_parent, fmap) in block.parents.iter_mut() {
             for (_fname, fval) in fmap.iter_mut() {
-                if fval.get("choices").is_none() || fval.get("value").is_none() {
-                    continue;
-                }
-                let raw = fval.get("value").cloned().unwrap_or(Value::Null);
-                let wrapped = if let Some(a) = raw.as_array() {
-                    Value::Array(
-                        a.iter()
-                            .map(|v| {
-                                let s = v.as_str().unwrap_or("");
-                                Value::String(format!("[selection]{s}"))
-                            })
-                            .collect(),
-                    )
-                } else {
-                    let s = raw.as_str().unwrap_or("");
-                    Value::String(format!("[selection]{s}"))
-                };
-                if let Some(o) = fval.as_object_mut() {
-                    o.insert("value".into(), wrapped);
+                if let StructureField::Rich(body) = fval {
+                    if body.choices.is_none() || body.value.is_none() {
+                        continue;
+                    }
+                    if let Some(raw) = body.value.take() {
+                        let wrapped = match raw {
+                            FieldDefault::Arr(a) => FieldDefault::Arr(
+                                a.into_iter().map(|s| format!("[selection]{s}")).collect(),
+                            ),
+                            FieldDefault::Str(s) => FieldDefault::Str(format!("[selection]{s}")),
+                        };
+                        body.value = Some(wrapped);
+                    }
                 }
             }
         }
     }
 }
 
-fn infer_from_json(schema: &Value) -> Result<InferredSchemas> {
+fn infer_from_json(schema: &ExtractionSchema) -> Result<InferredSchemas> {
     let mut schemas = Vec::new();
     let mut types = Vec::new();
 
@@ -354,7 +325,7 @@ fn transform_schema(
     parent: &str,
     fields: &[String],
     child_prefix: &str,
-    label_descriptions: Option<&serde_json::Map<String, Value>>,
+    label_descriptions: Option<&IndexMap<String, String>>,
     examples: &[(String, String)],
     example_mode: &str,
 ) -> Vec<String> {
@@ -368,13 +339,12 @@ fn transform_schema(
             .collect();
         pairs.sort_by_key(|(k, _)| *k);
         for (label, desc) in pairs {
-            let d = desc.as_str().unwrap_or("");
             prompt_str.push(' ');
             prompt_str.push_str(DESC_TOKEN);
             prompt_str.push(' ');
             prompt_str.push_str(label);
             prompt_str.push_str(": ");
-            prompt_str.push_str(d);
+            prompt_str.push_str(desc);
         }
     }
     if example_mode == "few_shot" || example_mode == "both" {
@@ -409,26 +379,17 @@ fn transform_schema(
 }
 
 fn process_json_structures(
-    schema: &Value,
+    schema: &ExtractionSchema,
     schemas: &mut Vec<Vec<String>>,
     types: &mut Vec<TaskType>,
 ) {
-    let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) else {
-        return;
-    };
-
-    let mut groups: Vec<(String, Vec<serde_json::Map<String, Value>>)> = Vec::new();
-    for item in arr {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        for (parent, fields) in obj {
-            if let Some(fmap) = fields.as_object() {
-                if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
-                    groups[i].1.push(fmap.clone());
-                } else {
-                    groups.push((parent.clone(), vec![fmap.clone()]));
-                }
+    let mut groups: Vec<(String, Vec<IndexMap<String, StructureField>>)> = Vec::new();
+    for block in &schema.json_structures {
+        for (parent, fmap) in &block.parents {
+            if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
+                groups[i].1.push(fmap.clone());
+            } else {
+                groups.push((parent.clone(), vec![fmap.clone()]));
             }
         }
     }
@@ -446,10 +407,7 @@ fn process_json_structures(
             continue;
         }
 
-        let json_descs = schema
-            .get("json_descriptions")
-            .and_then(|v| v.get(&parent))
-            .and_then(|v| v.as_object());
+        let json_descs = schema.json_descriptions.get(&parent);
 
         let mode = if json_descs.map(|d| !d.is_empty()).unwrap_or(false) {
             "descriptions"
@@ -475,18 +433,17 @@ fn process_json_structures(
     }
 }
 
-fn process_entities(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut Vec<TaskType>) {
-    let Some(ent) = schema.get("entities").and_then(|v| v.as_object()) else {
-        return;
-    };
-    if ent.is_empty() {
+fn process_entities(
+    schema: &ExtractionSchema,
+    schemas: &mut Vec<Vec<String>>,
+    types: &mut Vec<TaskType>,
+) {
+    if schema.entities.is_empty() {
         return;
     }
-    let chosen: Vec<String> = ent.keys().cloned().collect();
-    let descs = schema
-        .get("entity_descriptions")
-        .and_then(|v| v.as_object());
-    let mode = if descs.map(|d| !d.is_empty()).unwrap_or(false) {
+    let chosen: Vec<String> = schema.entities.keys().cloned().collect();
+    let descs = (!schema.entity_descriptions.is_empty()).then_some(&schema.entity_descriptions);
+    let mode = if descs.is_some() {
         "descriptions"
     } else {
         "none"
@@ -507,22 +464,21 @@ fn process_entities(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut 
     types.push(TaskType::Entities);
 }
 
-fn process_relations(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut Vec<TaskType>) {
-    let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) else {
-        return;
-    };
-    let mut groups: Vec<(String, Vec<serde_json::Map<String, Value>>)> = Vec::new();
-    for item in arr {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        for (parent, fields) in obj {
-            if let Some(fmap) = fields.as_object() {
-                if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
-                    groups[i].1.push(fmap.clone());
-                } else {
-                    groups.push((parent.clone(), vec![fmap.clone()]));
-                }
+fn process_relations(
+    schema: &ExtractionSchema,
+    schemas: &mut Vec<Vec<String>>,
+    types: &mut Vec<TaskType>,
+) {
+    let mut groups: Vec<(String, Vec<IndexMap<String, String>>)> = Vec::new();
+    for item in &schema.relations {
+        for (parent, endpoints) in &item.types {
+            let mut m = IndexMap::new();
+            m.insert("head".into(), endpoints.head.clone());
+            m.insert("tail".into(), endpoints.tail.clone());
+            if let Some(i) = groups.iter().position(|(p, _)| p == parent) {
+                groups[i].1.push(m);
+            } else {
+                groups.push((parent.clone(), vec![m]));
             }
         }
     }
@@ -535,54 +491,29 @@ fn process_relations(schema: &Value, schemas: &mut Vec<Vec<String>>, types: &mut
 }
 
 fn process_classifications(
-    schema: &Value,
+    schema: &ExtractionSchema,
     schemas: &mut Vec<Vec<String>>,
     types: &mut Vec<TaskType>,
 ) -> Result<()> {
-    let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) else {
-        return Ok(());
-    };
-    for item in arr {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        let task = obj
-            .get("task")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let labels: Vec<String> = obj
-            .get("labels")
-            .and_then(|v| v.as_array())
+    for cls in &schema.classifications {
+        let task = cls.task.clone();
+        let labels = cls.labels.clone();
+        let descs = cls.label_descriptions.as_ref();
+        let examples: Vec<(String, String)> = cls
+            .examples
+            .as_ref()
             .map(|a| {
                 a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let descs = obj.get("label_descriptions").and_then(|v| v.as_object());
-        let examples: Vec<(String, String)> = obj
-            .get("examples")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|ex| {
-                        if let Some(tup) = ex.as_array()
-                            && tup.len() >= 2
-                        {
-                            let inp = tup[0].as_str()?.to_string();
-                            let out = tup[1].as_str()?.to_string();
-                            return Some((inp, out));
+                    .filter_map(|ex| match ex {
+                        ClassificationExample::List(v) if v.len() >= 2 => {
+                            Some((v[0].clone(), v[1].clone()))
                         }
-                        let o = ex.as_object()?;
-                        let inp = o.get("input")?.as_str()?.to_string();
-                        let out = o.get("output")?.as_str()?.to_string();
-                        Some((inp, out))
+                        ClassificationExample::Obj(o) => Some((o.input.clone(), o.output.clone())),
+                        _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
-        // Inference uses example_mode "both" per Python when not training
         let mode = "both";
         let toks = transform_schema(&task, &labels, "[L]", descs, &examples, mode);
         schemas.push(toks);
@@ -593,8 +524,7 @@ fn process_classifications(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreprocessedInput, TaskType, collate_preprocessed};
-    use serde_json::json;
+    use super::{ExtractionSchema, PreprocessedInput, TaskType, collate_preprocessed};
 
     fn dummy_pre(seq_len: usize, id_base: u32) -> PreprocessedInput {
         PreprocessedInput {
@@ -608,8 +538,8 @@ mod tests {
             end_mappings: vec![],
             original_text: String::new(),
             len_prefix: 0,
-            schema_working: json!({}),
-            schema_original: json!({}),
+            schema_working: ExtractionSchema::default(),
+            schema_original: ExtractionSchema::default(),
         }
     }
 

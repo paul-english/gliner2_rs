@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use gliner2::schema::{SchemaInfo, StructureFieldInfo, StructureInfo, ValueDtype};
+use gliner2::{ExtractionOutput, LabelConfidence, TaskValue};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -267,40 +268,31 @@ pub fn generate_label_config(info: &SchemaInfo) -> String {
 /// Convert a single gliner2 extraction result to a Label Studio task with pre-annotations.
 ///
 /// Expects results produced with `include_spans=true` and `include_confidence=true`.
-pub fn convert_result_to_task(text: &str, result: &Value, info: &SchemaInfo) -> Value {
+pub fn convert_result_to_task(text: &str, result: &ExtractionOutput, info: &SchemaInfo) -> Value {
     let mut annotations: Vec<Value> = Vec::new();
 
-    if let Some(result_obj) = result.as_object() {
-        // Entities
-        if let Some(entities) = result_obj.get("entities").and_then(|v| v.as_object()) {
-            convert_entities(&mut annotations, entities, "label");
-        }
+    if let Some(TaskValue::Object(entities)) = result.fields.get("entities") {
+        convert_entities(&mut annotations, entities, "label");
+    }
 
-        // Relations
-        if let Some(rel_ext) = result_obj
-            .get("relation_extraction")
-            .and_then(|v| v.as_object())
-        {
-            let labels_name = if info.entities.is_empty() {
-                "relation_spans"
-            } else {
-                "label"
-            };
-            convert_relations(&mut annotations, rel_ext, labels_name);
-        }
+    if let Some(TaskValue::Object(rel_ext)) = result.fields.get("relation_extraction") {
+        let labels_name = if info.entities.is_empty() {
+            "relation_spans"
+        } else {
+            "label"
+        };
+        convert_relations(&mut annotations, rel_ext, labels_name);
+    }
 
-        // Classifications
-        for cls in &info.classifications {
-            if let Some(val) = result_obj.get(&cls.task) {
-                convert_classification(&mut annotations, &cls.task, val);
-            }
+    for cls in &info.classifications {
+        if let Some(val) = result.fields.get(&cls.task) {
+            convert_classification(&mut annotations, &cls.task, val);
         }
+    }
 
-        // Structures
-        for st in &info.structures {
-            if let Some(val) = result_obj.get(&st.name) {
-                convert_structure(&mut annotations, st, val);
-            }
+    for st in &info.structures {
+        if let Some(val) = result.fields.get(&st.name) {
+            convert_structure(&mut annotations, st, val);
         }
     }
 
@@ -313,29 +305,61 @@ pub fn convert_result_to_task(text: &str, result: &Value, info: &SchemaInfo) -> 
     })
 }
 
+fn u64_from_task(v: &TaskValue) -> Option<u64> {
+    match v {
+        TaskValue::U64(n) => Some(*n),
+        TaskValue::F64(f) => {
+            if !f.is_finite() || *f < 0.0 {
+                return None;
+            }
+            let r = f.round();
+            if (r - *f).abs() < 1e-9 && r <= u64::MAX as f64 {
+                Some(r as u64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn f64_from_task(v: &TaskValue) -> Option<f64> {
+    match v {
+        TaskValue::F64(x) => Some(*x),
+        TaskValue::U64(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
 fn convert_entities(
     annotations: &mut Vec<Value>,
-    entities: &serde_json::Map<String, Value>,
+    entities: &std::collections::BTreeMap<String, TaskValue>,
     labels_name: &str,
 ) {
     for (label, items) in entities {
-        if let Some(arr) = items.as_array() {
-            for item in arr {
-                if let Some(ann) = span_to_label_annotation(item, label, labels_name) {
-                    annotations.push(ann);
-                }
+        let TaskValue::Array(arr) = items else {
+            continue;
+        };
+        for item in arr {
+            if let Some(ann) = span_to_label_annotation(item, label, labels_name) {
+                annotations.push(ann);
             }
         }
     }
 }
 
-fn span_to_label_annotation(item: &Value, label: &str, from_name: &str) -> Option<Value> {
-    let obj = item.as_object()?;
-    let start = obj.get("start")?.as_u64()?;
-    let end = obj.get("end")?.as_u64()?;
-    let text = obj.get("text")?.as_str()?;
+fn span_to_label_annotation(item: &TaskValue, label: &str, from_name: &str) -> Option<Value> {
+    let TaskValue::Object(obj) = item else {
+        return None;
+    };
+    let start = u64_from_task(obj.get("start")?)?;
+    let end = u64_from_task(obj.get("end")?)?;
+    let text = match obj.get("text")? {
+        TaskValue::String(s) => s.as_str(),
+        _ => return None,
+    };
     let id = format!("{}_{start}_{end}", from_name);
-    let confidence = obj.get("confidence").and_then(|v| v.as_f64());
+    let confidence = obj.get("confidence").and_then(f64_from_task);
 
     let mut ann = json!({
         "id": id,
@@ -359,73 +383,78 @@ fn span_to_label_annotation(item: &Value, label: &str, from_name: &str) -> Optio
 
 fn convert_relations(
     annotations: &mut Vec<Value>,
-    rel_ext: &serde_json::Map<String, Value>,
+    rel_ext: &std::collections::BTreeMap<String, TaskValue>,
     labels_name: &str,
 ) {
     for (rel_name, items) in rel_ext {
-        if let Some(arr) = items.as_array() {
-            for (i, item) in arr.iter().enumerate() {
-                let obj = match item.as_object() {
-                    Some(o) => o,
-                    None => continue,
-                };
-                let head = match obj.get("head") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let tail = match obj.get("tail") {
-                    Some(v) => v,
-                    None => continue,
-                };
+        let TaskValue::Array(arr) = items else {
+            continue;
+        };
+        for (i, item) in arr.iter().enumerate() {
+            let TaskValue::Object(obj) = item else {
+                continue;
+            };
+            let Some(head) = obj.get("head") else {
+                continue;
+            };
+            let Some(tail) = obj.get("tail") else {
+                continue;
+            };
 
-                let head_id = format!("rel_{rel_name}_{i}_head");
-                let tail_id = format!("rel_{rel_name}_{i}_tail");
+            let head_id = format!("rel_{rel_name}_{i}_head");
+            let tail_id = format!("rel_{rel_name}_{i}_tail");
 
-                // Create span regions for head and tail
-                if let Some(mut head_ann) = span_to_label_annotation(head, "head", labels_name) {
-                    head_ann["id"] = json!(head_id.clone());
-                    annotations.push(head_ann);
-                }
-                if let Some(mut tail_ann) = span_to_label_annotation(tail, "tail", labels_name) {
-                    tail_ann["id"] = json!(tail_id.clone());
-                    annotations.push(tail_ann);
-                }
-
-                // Create the relation linking them
-                annotations.push(json!({
-                    "from_id": head_id,
-                    "to_id": tail_id,
-                    "type": "relation",
-                    "direction": "right",
-                    "labels": [rel_name],
-                }));
+            if let Some(mut head_ann) = span_to_label_annotation(head, "head", labels_name) {
+                head_ann["id"] = json!(head_id.clone());
+                annotations.push(head_ann);
             }
+            if let Some(mut tail_ann) = span_to_label_annotation(tail, "tail", labels_name) {
+                tail_ann["id"] = json!(tail_id.clone());
+                annotations.push(tail_ann);
+            }
+
+            annotations.push(json!({
+                "from_id": head_id,
+                "to_id": tail_id,
+                "type": "relation",
+                "direction": "right",
+                "labels": [rel_name],
+            }));
         }
     }
 }
 
-fn convert_classification(annotations: &mut Vec<Value>, task: &str, val: &Value) {
-    let choices: Vec<String> = match val {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(arr) => arr
+fn classification_choice_strings(val: &TaskValue) -> Vec<String> {
+    match val {
+        TaskValue::String(s) => vec![s.clone()],
+        TaskValue::StringArray(a) => a.clone(),
+        TaskValue::LabelConfidence(LabelConfidence { label, .. }) => vec![label.clone()],
+        TaskValue::LabelConfidenceList(list) => list.iter().map(|l| l.label.clone()).collect(),
+        TaskValue::Array(arr) => arr
             .iter()
             .filter_map(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                // With include_confidence, labels may be objects
-                Value::Object(o) => o.get("label").and_then(|l| l.as_str()).map(String::from),
+                TaskValue::String(s) => Some(s.clone()),
+                TaskValue::LabelConfidence(l) => Some(l.label.clone()),
+                TaskValue::Object(o) => match o.get("label")? {
+                    TaskValue::String(s) => Some(s.clone()),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect(),
-        Value::Object(o) => {
-            // Single-label with confidence: {"label": "X", "confidence": 0.9}
-            o.get("label")
-                .and_then(|l| l.as_str())
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default()
-        }
-        _ => return,
-    };
+        TaskValue::Object(o) => o
+            .get("label")
+            .and_then(|t| match t {
+                TaskValue::String(s) => Some(vec![s.clone()]),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        _ => vec![],
+    }
+}
 
+fn convert_classification(annotations: &mut Vec<Value>, task: &str, val: &TaskValue) {
+    let choices = classification_choice_strings(val);
     if !choices.is_empty() {
         annotations.push(json!({
             "from_name": task,
@@ -436,33 +465,42 @@ fn convert_classification(annotations: &mut Vec<Value>, task: &str, val: &Value)
     }
 }
 
-fn convert_structure(annotations: &mut Vec<Value>, st: &StructureInfo, val: &Value) {
-    let instances = match val {
-        Value::Array(arr) => arr.as_slice(),
-        _ => return,
+fn structure_choice_strings(fval: &TaskValue) -> Option<Vec<String>> {
+    match fval {
+        TaskValue::String(s) => Some(vec![s.clone()]),
+        TaskValue::StringArray(a) => Some(a.clone()),
+        TaskValue::Array(arr) => {
+            let v: Vec<String> = arr
+                .iter()
+                .filter_map(|v| match v {
+                    TaskValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            (!v.is_empty()).then_some(v)
+        }
+        _ => None,
+    }
+}
+
+fn convert_structure(annotations: &mut Vec<Value>, st: &StructureInfo, val: &TaskValue) {
+    let TaskValue::Array(instances) = val else {
+        return;
     };
 
     for instance in instances {
-        let obj = match instance.as_object() {
-            Some(o) => o,
-            None => continue,
+        let TaskValue::Object(obj) = instance else {
+            continue;
         };
 
         for field in &st.fields {
-            let fval = match obj.get(&field.name) {
-                Some(v) => v,
-                None => continue,
+            let Some(fval) = obj.get(&field.name) else {
+                continue;
             };
 
             if field.choices.is_some() {
-                // Choice field -> Choices annotation
-                let choices: Vec<String> = match fval {
-                    Value::String(s) => vec![s.clone()],
-                    Value::Array(arr) => arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                    _ => continue,
+                let Some(choices) = structure_choice_strings(fval) else {
+                    continue;
                 };
                 if !choices.is_empty() {
                     let name = format!("{}__{}", st.name, field.name);
@@ -474,9 +512,8 @@ fn convert_structure(annotations: &mut Vec<Value>, st: &StructureInfo, val: &Val
                     }));
                 }
             } else {
-                // Span field -> Labels annotation
-                let items: Vec<&Value> = match fval {
-                    Value::Array(arr) => arr.iter().collect(),
+                let items: Vec<&TaskValue> = match fval {
+                    TaskValue::Array(arr) => arr.iter().collect(),
                     other => vec![other],
                 };
                 for item in items {
@@ -739,7 +776,7 @@ mod tests {
     #[test]
     fn convert_entity_result() {
         let info = sample_entity_info();
-        let result = json!({
+        let result: ExtractionOutput = serde_json::from_value(json!({
             "entities": {
                 "person": [
                     {"text": "John", "start": 0, "end": 4, "confidence": 0.95}
@@ -748,7 +785,8 @@ mod tests {
                     {"text": "Acme", "start": 10, "end": 14, "confidence": 0.88}
                 ]
             }
-        });
+        }))
+        .unwrap();
         let task = convert_result_to_task("John works at Acme", &result, &info);
         assert_eq!(task["data"]["text"], "John works at Acme");
         let preds = task["predictions"].as_array().unwrap();
@@ -776,7 +814,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = json!({ "sentiment": "positive" });
+        let result: ExtractionOutput =
+            serde_json::from_value(json!({ "sentiment": "positive" })).unwrap();
         let task = convert_result_to_task("Great product!", &result, &info);
         let results = task["predictions"][0]["result"].as_array().unwrap();
         assert_eq!(results.len(), 1);
@@ -792,14 +831,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        let result = json!({
+        let result: ExtractionOutput = serde_json::from_value(json!({
             "relation_extraction": {
                 "works_for": [{
                     "head": {"text": "John", "start": 0, "end": 4, "confidence": 0.9},
                     "tail": {"text": "Acme", "start": 14, "end": 18, "confidence": 0.85}
                 }]
             }
-        });
+        }))
+        .unwrap();
         let task = convert_result_to_task("John works for Acme", &result, &info);
         let results = task["predictions"][0]["result"].as_array().unwrap();
         // head region + tail region + relation = 3 annotations

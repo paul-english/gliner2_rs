@@ -1,9 +1,9 @@
 //! Python-aligned `Schema` builder and extraction metadata (`gliner2.inference.engine.Schema`).
 
 use anyhow::{Context, Result as AnyResult};
+use indexmap::IndexMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 /// Match mode for [`RegexValidator`] (Python `RegexValidator.mode`: `"full"` | `"partial"`).
@@ -67,6 +67,9 @@ pub enum ValueDtype {
     List,
 }
 
+mod schema_document;
+pub use schema_document::*;
+
 /// Parsed `extract_json` field spec (string `name::dtype::[choices]::description` or JSON object).
 #[derive(Clone, Debug)]
 pub struct ParsedFieldSpec {
@@ -77,32 +80,23 @@ pub struct ParsedFieldSpec {
     pub validators: Vec<RegexValidator>,
 }
 
-fn parse_validator_specs(arr: &[Value]) -> Vec<RegexValidator> {
+fn parse_validator_specs(arr: &[ValidatorSpec]) -> Vec<RegexValidator> {
     let mut out = Vec::new();
-    for v in arr {
-        let Some(o) = v.as_object() else {
-            continue;
-        };
-        let Some(pattern) = o.get("pattern").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        if pattern.is_empty() {
+    for spec in arr {
+        if spec.pattern.is_empty() {
             continue;
         }
-        let mode = o
-            .get("mode")
-            .and_then(|x| x.as_str())
+        let mode = spec
+            .mode
+            .as_deref()
             .map(|s| match s {
                 "partial" => RegexMatchMode::Partial,
                 _ => RegexMatchMode::Full,
             })
             .unwrap_or(RegexMatchMode::Full);
-        let exclude = o.get("exclude").and_then(|x| x.as_bool()).unwrap_or(false);
-        let case_insensitive = o
-            .get("case_insensitive")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(true);
-        if let Ok(val) = RegexValidator::new(pattern, mode, exclude, case_insensitive) {
+        let exclude = spec.exclude.unwrap_or(false);
+        let case_insensitive = spec.case_insensitive.unwrap_or(true);
+        if let Ok(val) = RegexValidator::new(&spec.pattern, mode, exclude, case_insensitive) {
             out.push(val);
         }
     }
@@ -110,47 +104,29 @@ fn parse_validator_specs(arr: &[Value]) -> Vec<RegexValidator> {
 }
 
 /// Parse a field spec string or object (Python `GLiNER2._parse_field_spec`).
-pub fn parse_field_spec(spec: &Value) -> AnyResult<ParsedFieldSpec> {
-    if let Some(o) = spec.as_object() {
-        let name = o
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let dtype = o
-            .get("dtype")
-            .and_then(|v| v.as_str())
-            .map(parse_field_dtype_token)
-            .unwrap_or(ValueDtype::List);
-        let choices = o.get("choices").and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect::<Vec<_>>()
+pub fn parse_field_spec(spec: &FieldSpecSource) -> AnyResult<ParsedFieldSpec> {
+    match spec {
+        FieldSpecSource::Obj(o) => {
+            let dtype = o
+                .dtype
+                .as_deref()
+                .map(parse_field_dtype_token)
+                .unwrap_or(ValueDtype::List);
+            let validators = o
+                .validators
+                .as_ref()
+                .map(|a| parse_validator_specs(a))
+                .unwrap_or_default();
+            Ok(ParsedFieldSpec {
+                name: o.name.clone(),
+                dtype,
+                choices: o.choices.clone(),
+                description: o.description.clone(),
+                validators,
             })
-        });
-        let description = o
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let validators = o
-            .get("validators")
-            .and_then(|v| v.as_array())
-            .map(|a| parse_validator_specs(a))
-            .unwrap_or_default();
-        return Ok(ParsedFieldSpec {
-            name,
-            dtype,
-            choices,
-            description,
-            validators,
-        });
+        }
+        FieldSpecSource::Str(s) => parse_field_spec_str(s),
     }
-
-    let s = spec
-        .as_str()
-        .context("field spec must be a string or a JSON object")?;
-    parse_field_spec_str(s)
 }
 
 fn parse_field_dtype_token(s: &str) -> ValueDtype {
@@ -242,10 +218,10 @@ pub struct ExtractionMetadata {
     pub classification_tasks: Vec<String>,
 }
 
-/// Mutable schema builder; call `.build()` for a JSON value suitable for preprocessing.
+/// Mutable schema builder; call `.build()` for an [`ExtractionSchema`] suitable for preprocessing.
 #[derive(Debug)]
 pub struct Schema {
-    inner: Map<String, Value>,
+    document: ExtractionSchema,
     field_metadata: HashMap<String, FieldMeta>,
     entity_metadata: HashMap<String, EntityMeta>,
     relation_metadata: HashMap<String, RelationMeta>,
@@ -258,22 +234,15 @@ pub struct Schema {
 #[derive(Debug)]
 struct StructureBuilderState {
     parent: String,
-    fields: Map<String, Value>,
+    fields: IndexMap<String, StructureField>,
     field_order: Vec<String>,
-    descriptions: Map<String, Value>,
+    descriptions: IndexMap<String, String>,
 }
 
 impl Schema {
     pub fn new() -> Self {
-        let mut inner = Map::new();
-        inner.insert("json_structures".into(), json!([]));
-        inner.insert("classifications".into(), json!([]));
-        inner.insert("entities".into(), json!({}));
-        inner.insert("relations".into(), json!([]));
-        inner.insert("json_descriptions".into(), json!({}));
-        inner.insert("entity_descriptions".into(), json!({}));
         Self {
-            inner,
+            document: ExtractionSchema::default(),
             field_metadata: HashMap::new(),
             entity_metadata: HashMap::new(),
             relation_metadata: HashMap::new(),
@@ -287,22 +256,16 @@ impl Schema {
     fn finish_structure_if_any(&mut self) {
         if let Some(st) = self.active_structure.take() {
             self.field_orders.insert(st.parent.clone(), st.field_order);
-            let arr = self
-                .inner
-                .get_mut("json_structures")
-                .and_then(|v| v.as_array_mut())
-                .expect("json_structures");
-            let mut obj = Map::new();
             let parent = st.parent.clone();
-            obj.insert(parent.clone(), Value::Object(st.fields));
-            arr.push(Value::Object(obj));
+            let mut parents = IndexMap::new();
+            parents.insert(parent.clone(), st.fields);
+            self.document
+                .json_structures
+                .push(JsonStructureBlock { parents });
             if !st.descriptions.is_empty() {
-                let jd = self
-                    .inner
-                    .get_mut("json_descriptions")
-                    .and_then(|v| v.as_object_mut())
-                    .expect("json_descriptions");
-                jd.insert(parent, Value::Object(st.descriptions));
+                self.document
+                    .json_descriptions
+                    .insert(parent, st.descriptions);
             }
         }
     }
@@ -312,9 +275,9 @@ impl Schema {
         let parent = name.into();
         self.active_structure = Some(StructureBuilderState {
             parent: parent.clone(),
-            fields: Map::new(),
+            fields: IndexMap::new(),
             field_order: Vec::new(),
-            descriptions: Map::new(),
+            descriptions: IndexMap::new(),
         });
         StructureBuilder { schema: self }
     }
@@ -325,11 +288,11 @@ impl Schema {
     }
 
     /// Add structures from `extract_json`-style maps: `{ "parent": ["field::str::...", ...], ... }`.
-    pub fn extract_json_structures(&mut self, structures: &Map<String, Value>) -> AnyResult<()> {
-        for (parent, fields_val) in structures {
-            let arr = fields_val.as_array().with_context(|| {
-                format!("extract_json_structures: {parent:?} must be a JSON array")
-            })?;
+    pub fn extract_json_structures(
+        &mut self,
+        structures: &IndexMap<String, Vec<FieldSpecSource>>,
+    ) -> AnyResult<()> {
+        for (parent, arr) in structures {
             let mut builder = self.structure(parent.clone());
             for spec in arr {
                 let p = parse_field_spec(spec).with_context(|| {
@@ -348,20 +311,15 @@ impl Schema {
         Ok(())
     }
 
-    /// `entity_types`: names, or map name -> description string / config object.
-    pub fn entities(&mut self, entity_types: Value) -> &mut Self {
+    /// `entity_types`: names, or map name → description string / config object.
+    pub fn entities(&mut self, entity_types: EntityTypesInput) -> &mut Self {
         self.finish_structure_if_any();
         match entity_types {
-            Value::String(s) => {
-                let entities = self
-                    .inner
-                    .get_mut("entities")
-                    .and_then(|v| v.as_object_mut())
-                    .expect("entities");
+            EntityTypesInput::One(s) => {
                 if !self.entity_order.contains(&s) {
                     self.entity_order.push(s.clone());
                 }
-                entities.insert(s.clone(), json!(""));
+                self.document.entities.insert(s.clone(), String::new());
                 self.entity_metadata.insert(
                     s,
                     EntityMeta {
@@ -370,21 +328,15 @@ impl Schema {
                     },
                 );
             }
-            Value::Array(arr) => {
-                let entities = self
-                    .inner
-                    .get_mut("entities")
-                    .and_then(|v| v.as_object_mut())
-                    .expect("entities");
-                for v in arr {
-                    let name = v.as_str().unwrap_or("").to_string();
+            EntityTypesInput::Many(arr) => {
+                for name in arr {
                     if name.is_empty() {
                         continue;
                     }
                     if !self.entity_order.contains(&name) {
                         self.entity_order.push(name.clone());
                     }
-                    entities.insert(name.clone(), json!(""));
+                    self.document.entities.insert(name.clone(), String::new());
                     self.entity_metadata.insert(
                         name,
                         EntityMeta {
@@ -394,26 +346,19 @@ impl Schema {
                     );
                 }
             }
-            Value::Object(map) => {
-                let mut ent_map = self
-                    .inner
-                    .remove("entities")
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
-                let mut desc_map = self
-                    .inner
-                    .remove("entity_descriptions")
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
+            EntityTypesInput::WithMeta(map) => {
                 for (name, cfg) in map {
                     if !self.entity_order.contains(&name) {
                         self.entity_order.push(name.clone());
                     }
-                    let (description, dtype, threshold) = parse_entity_config(&cfg);
+                    let (description, dtype, threshold) = match cfg {
+                        EntityTypeConfigInput::DescriptionOnly(d) => (Some(d), None, None),
+                        EntityTypeConfigInput::Full(c) => (c.description, c.dtype, c.threshold),
+                    };
                     if let Some(d) = description {
-                        desc_map.insert(name.clone(), json!(d));
+                        self.document.entity_descriptions.insert(name.clone(), d);
                     }
-                    ent_map.insert(name.clone(), json!(""));
+                    self.document.entities.insert(name.clone(), String::new());
                     self.entity_metadata.insert(
                         name.clone(),
                         EntityMeta {
@@ -422,112 +367,99 @@ impl Schema {
                         },
                     );
                 }
-                self.inner.insert("entities".into(), Value::Object(ent_map));
-                self.inner
-                    .insert("entity_descriptions".into(), Value::Object(desc_map));
             }
-            _ => {}
         }
         self
     }
 
     /// Single-label classification with default `cls_threshold` 0.5.
-    pub fn classification_simple(&mut self, task: impl Into<String>, labels: Value) -> &mut Self {
+    pub fn classification_simple(
+        &mut self,
+        task: impl Into<String>,
+        labels: ClassificationLabelsInput,
+    ) -> &mut Self {
         self.classification(task, labels, false, 0.5)
     }
 
     pub fn classification(
         &mut self,
         task: impl Into<String>,
-        labels: Value,
+        labels: ClassificationLabelsInput,
         multi_label: bool,
         cls_threshold: f32,
     ) -> &mut Self {
         self.finish_structure_if_any();
         let task = task.into();
-        let (label_names, label_descs) = parse_labels(labels);
-        let mut cfg = Map::new();
-        cfg.insert("task".into(), json!(task.clone()));
-        cfg.insert("labels".into(), json!(label_names.clone()));
-        cfg.insert("multi_label".into(), json!(multi_label));
-        cfg.insert(
-            "cls_threshold".into(),
-            serde_json::Number::from_f64(cls_threshold as f64)
-                .unwrap()
-                .into(),
-        );
-        cfg.insert("true_label".into(), json!(["N/A"]));
-        if let Some(descs) = label_descs {
-            cfg.insert("label_descriptions".into(), Value::Object(descs));
-        }
-        self.inner
-            .get_mut("classifications")
-            .and_then(|v| v.as_array_mut())
-            .expect("classifications")
-            .push(Value::Object(cfg));
+        let (label_names, label_descs) = match labels {
+            ClassificationLabelsInput::List(v) => (v, None),
+            ClassificationLabelsInput::WithDescriptions(m) => {
+                let names: Vec<String> = m.keys().cloned().collect();
+                (names, Some(m))
+            }
+        };
+        self.document.classifications.push(ClassificationConfig {
+            task,
+            labels: label_names,
+            multi_label,
+            cls_threshold,
+            true_label: Some(vec!["N/A".into()]),
+            label_descriptions: label_descs,
+            examples: None,
+            class_act: None,
+        });
         self
     }
 
-    pub fn relations(&mut self, relation_types: Value) -> &mut Self {
+    pub fn relations(&mut self, relation_types: RelationTypesInput) -> &mut Self {
         self.finish_structure_if_any();
-        let rels = self
-            .inner
-            .get_mut("relations")
-            .and_then(|v| v.as_array_mut())
-            .expect("relations");
 
-        let mut add_one = |name: String, threshold: Option<f32>| {
-            let mut inner = Map::new();
-            let mut fields = Map::new();
-            fields.insert("head".into(), json!(""));
-            fields.insert("tail".into(), json!(""));
-            inner.insert(name.clone(), Value::Object(fields));
-            rels.push(Value::Object(inner));
-            if !self.relation_order.contains(&name) {
-                self.relation_order.push(name.clone());
+        let add_one = |this: &mut Self, name: String, threshold: Option<f32>| {
+            let mut types = IndexMap::new();
+            types.insert(
+                name.clone(),
+                RelationEndpoints {
+                    head: String::new(),
+                    tail: String::new(),
+                },
+            );
+            this.document.relations.push(RelationBlock { types });
+            if !this.relation_order.contains(&name) {
+                this.relation_order.push(name.clone());
             }
-            self.field_orders
+            this.field_orders
                 .insert(name.clone(), vec!["head".into(), "tail".into()]);
-            self.relation_metadata
+            this.relation_metadata
                 .insert(name, RelationMeta { threshold });
         };
 
         match relation_types {
-            Value::String(s) => add_one(s, None),
-            Value::Array(arr) => {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        add_one(s.to_string(), None);
-                    }
+            RelationTypesInput::One(s) => add_one(self, s, None),
+            RelationTypesInput::Many(arr) => {
+                for s in arr {
+                    add_one(self, s, None);
                 }
             }
-            Value::Object(map) => {
+            RelationTypesInput::WithMeta(map) => {
                 for (name, cfg) in map {
-                    let (desc, threshold) = parse_relation_config(&cfg);
-                    if desc.is_some() {
-                        // Python stores description in relation metadata only indirectly;
-                        // keep relation row as empty head/tail.
-                    }
-                    add_one(name, threshold);
+                    let (_desc, threshold) = match cfg {
+                        RelationTypeConfigInput::DescriptionOnly(_d) => (None, None),
+                        RelationTypeConfigInput::Full(c) => (c.description, c.threshold),
+                    };
+                    add_one(self, name, threshold);
                 }
             }
-            _ => {}
         }
         self
     }
 
-    pub fn build(&mut self) -> (Value, ExtractionMetadata) {
+    pub fn build(&mut self) -> (ExtractionSchema, ExtractionMetadata) {
         self.finish_structure_if_any();
-        let classification_tasks: Vec<String> = self
-            .inner
-            .get("classifications")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c.get("task").and_then(|t| t.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let classification_tasks = self
+            .document
+            .classifications
+            .iter()
+            .map(|c| c.task.clone())
+            .collect();
 
         let meta = ExtractionMetadata {
             field_metadata: self.field_metadata.clone(),
@@ -538,7 +470,7 @@ impl Schema {
             relation_order: self.relation_order.clone(),
             classification_tasks,
         };
-        (Value::Object(self.inner.clone()), meta)
+        (self.document.clone(), meta)
     }
 }
 
@@ -583,14 +515,32 @@ impl<'a> StructureBuilder<'a> {
         let st = self.schema.active_structure.as_mut().expect("structure");
         st.field_order.push(name.clone());
         let v = match (&choices, dtype) {
-            (Some(c), ValueDtype::Str) => json!({ "value": "", "choices": c, "dtype": "str" }),
-            (Some(c), ValueDtype::List) => json!({ "value": "", "choices": c }),
-            (None, ValueDtype::Str) => json!({ "dtype": "str" }),
-            (None, ValueDtype::List) => json!(""),
+            (Some(c), ValueDtype::Str) => StructureField::Rich(StructureFieldBody {
+                value: Some(FieldDefault::Str(String::new())),
+                choices: Some(c.clone()),
+                dtype: Some(ValueDtype::Str),
+                threshold: None,
+                validators: vec![],
+            }),
+            (Some(c), ValueDtype::List) => StructureField::Rich(StructureFieldBody {
+                value: Some(FieldDefault::Str(String::new())),
+                choices: Some(c.clone()),
+                dtype: None,
+                threshold: None,
+                validators: vec![],
+            }),
+            (None, ValueDtype::Str) => StructureField::Rich(StructureFieldBody {
+                value: None,
+                choices: None,
+                dtype: Some(ValueDtype::Str),
+                threshold: None,
+                validators: vec![],
+            }),
+            (None, ValueDtype::List) => StructureField::Plain(String::new()),
         };
         st.fields.insert(name.clone(), v);
         if let Some(d) = description {
-            st.descriptions.insert(name.clone(), json!(d));
+            st.descriptions.insert(name.clone(), d);
         }
         self.schema.field_metadata.insert(
             format!("{}.{}", st.parent, name),
@@ -611,145 +561,55 @@ impl Default for Schema {
     }
 }
 
-fn parse_entity_config(cfg: &Value) -> (Option<String>, Option<ValueDtype>, Option<f32>) {
-    match cfg {
-        Value::String(d) => (Some(d.clone()), None, None),
-        Value::Object(m) => {
-            let desc = m
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let dtype = m
-                .get("dtype")
-                .and_then(|v| v.as_str())
-                .and_then(|s| match s {
-                    "str" => Some(ValueDtype::Str),
-                    "list" => Some(ValueDtype::List),
-                    _ => None,
-                });
-            let threshold = m
-                .get("threshold")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32);
-            (desc, dtype, threshold)
-        }
-        _ => (None, None, None),
-    }
-}
-
-fn parse_relation_config(cfg: &Value) -> (Option<String>, Option<f32>) {
-    match cfg {
-        Value::String(d) => (Some(d.clone()), None),
-        Value::Object(m) => {
-            let desc = m
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let threshold = m
-                .get("threshold")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32);
-            (desc, threshold)
-        }
-        _ => (None, None),
-    }
-}
-
-fn parse_labels(labels: Value) -> (Vec<String>, Option<Map<String, Value>>) {
-    match labels {
-        Value::Array(arr) => (
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            None,
-        ),
-        Value::Object(map) => {
-            let names: Vec<String> = map.keys().cloned().collect();
-            (names, Some(map))
-        }
-        _ => (Vec::new(), None),
-    }
-}
-
 /// Start a new schema (equivalent to `GLiNER2.create_schema()`).
 pub fn create_schema() -> Schema {
     Schema::new()
 }
 
-/// Metadata for a plain schema dict (mirrors Python `batch_extract` when `schema` is a `dict`, not a `Schema` instance).
-pub fn infer_metadata_from_schema(schema: &Value) -> ExtractionMetadata {
-    let mut meta = ExtractionMetadata::default();
-
-    if let Some(ent) = schema.get("entities").and_then(|v| v.as_object()) {
-        meta.entity_order = ent.keys().cloned().collect();
-    }
-
-    if let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) {
-        meta.classification_tasks = arr
+/// Metadata derived from a loaded [`ExtractionSchema`] (Python `batch_extract` with a schema dict).
+pub fn infer_metadata_from_schema(schema: &ExtractionSchema) -> ExtractionMetadata {
+    let mut meta = ExtractionMetadata {
+        entity_order: schema.entities.keys().cloned().collect(),
+        classification_tasks: schema
+            .classifications
             .iter()
-            .filter_map(|c| c.get("task").and_then(|t| t.as_str()).map(String::from))
-            .collect();
-    }
+            .map(|c| c.task.clone())
+            .collect(),
+        ..Default::default()
+    };
 
-    if let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) {
-        for st in arr {
-            if let Some(obj) = st.as_object() {
-                for (parent, fields) in obj {
-                    if let Some(fmap) = fields.as_object() {
-                        meta.field_orders
-                            .insert(parent.clone(), fmap.keys().cloned().collect());
-                        for (fname, fval) in fmap {
-                            let key = format!("{parent}.{fname}");
-                            let dtype = fval
-                                .get("dtype")
-                                .and_then(|v| v.as_str())
-                                .map(|s| match s {
-                                    "str" => ValueDtype::Str,
-                                    _ => ValueDtype::List,
-                                })
-                                .unwrap_or(ValueDtype::List);
-                            let threshold = fval
-                                .get("threshold")
-                                .and_then(|v| v.as_f64())
-                                .map(|f| f as f32);
-                            let choices = fval.get("choices").and_then(|c| c.as_array()).map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect::<Vec<_>>()
-                            });
-                            let validators = fval
-                                .as_object()
-                                .and_then(|o| o.get("validators"))
-                                .and_then(|v| v.as_array())
-                                .map(|a| parse_validator_specs(a))
-                                .unwrap_or_default();
-                            meta.field_metadata.insert(
-                                key.clone(),
-                                FieldMeta {
-                                    dtype,
-                                    threshold,
-                                    choices,
-                                    validators,
-                                },
-                            );
-                        }
-                    }
-                }
+    for block in &schema.json_structures {
+        for (parent, fmap) in &block.parents {
+            meta.field_orders
+                .insert(parent.clone(), fmap.keys().cloned().collect());
+            for (fname, fval) in fmap {
+                let key = format!("{parent}.{fname}");
+                let fm = match fval {
+                    StructureField::Plain(_) => FieldMeta {
+                        dtype: ValueDtype::List,
+                        threshold: None,
+                        choices: None,
+                        validators: vec![],
+                    },
+                    StructureField::Rich(body) => FieldMeta {
+                        dtype: body.dtype.unwrap_or(ValueDtype::List),
+                        threshold: body.threshold,
+                        choices: body.choices.clone(),
+                        validators: parse_validator_specs(&body.validators),
+                    },
+                };
+                meta.field_metadata.insert(key, fm);
             }
         }
     }
 
-    if let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) {
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                for (rel_name, _) in obj {
-                    if !meta.relation_order.contains(rel_name) {
-                        meta.relation_order.push(rel_name.clone());
-                    }
-                    meta.field_orders
-                        .insert(rel_name.clone(), vec!["head".into(), "tail".into()]);
-                }
+    for block in &schema.relations {
+        for rel_name in block.types.keys() {
+            if !meta.relation_order.contains(rel_name) {
+                meta.relation_order.push(rel_name.clone());
             }
+            meta.field_orders
+                .insert(rel_name.clone(), vec!["head".into(), "tail".into()]);
         }
     }
 
@@ -807,114 +667,61 @@ pub struct SchemaInfo {
 }
 
 impl SchemaInfo {
-    /// Extract structured task information from a built schema JSON value.
-    pub fn from_value(schema: &Value) -> Self {
+    /// Extract structured task information from a schema document.
+    pub fn from_schema(schema: &ExtractionSchema) -> Self {
         let mut info = SchemaInfo::default();
 
-        // Entities
-        if let Some(ent_obj) = schema.get("entities").and_then(|v| v.as_object()) {
-            let desc_obj = schema
-                .get("entity_descriptions")
-                .and_then(|v| v.as_object());
-            for name in ent_obj.keys() {
-                let description = desc_obj
-                    .and_then(|d| d.get(name))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-                info.entities.push(EntityTypeInfo {
-                    name: name.clone(),
-                    description,
+        for name in schema.entities.keys() {
+            let description = schema
+                .entity_descriptions
+                .get(name)
+                .filter(|s| !s.is_empty())
+                .cloned();
+            info.entities.push(EntityTypeInfo {
+                name: name.clone(),
+                description,
+            });
+        }
+
+        for block in &schema.relations {
+            for rel_name in block.types.keys() {
+                info.relations.push(RelationTypeInfo {
+                    name: rel_name.clone(),
                 });
             }
         }
 
-        // Relations
-        if let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(obj) = item.as_object() {
-                    for rel_name in obj.keys() {
-                        info.relations.push(RelationTypeInfo {
-                            name: rel_name.clone(),
-                        });
-                    }
-                }
+        for cls in &schema.classifications {
+            if !cls.task.is_empty() {
+                info.classifications.push(ClassificationTaskInfo {
+                    task: cls.task.clone(),
+                    labels: cls.labels.clone(),
+                    multi_label: cls.multi_label,
+                });
             }
         }
 
-        // Classifications
-        if let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) {
-            for cls in arr {
-                let task = cls
-                    .get("task")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let labels = cls
-                    .get("labels")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let multi_label = cls
-                    .get("multi_label")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !task.is_empty() {
-                    info.classifications.push(ClassificationTaskInfo {
-                        task,
-                        labels,
-                        multi_label,
+        for st in &schema.json_structures {
+            for (parent, fmap) in &st.parents {
+                let mut fields = Vec::new();
+                for (fname, fval) in fmap {
+                    let (dtype, choices) = match fval {
+                        StructureField::Plain(_) => (ValueDtype::List, None),
+                        StructureField::Rich(body) => {
+                            let dt = body.dtype.unwrap_or(ValueDtype::List);
+                            (dt, body.choices.clone())
+                        }
+                    };
+                    fields.push(StructureFieldInfo {
+                        name: fname.clone(),
+                        dtype,
+                        choices,
                     });
                 }
-            }
-        }
-
-        // JSON structures
-        if let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) {
-            for st in arr {
-                if let Some(obj) = st.as_object() {
-                    for (parent, fields_val) in obj {
-                        let mut fields = Vec::new();
-                        if let Some(fmap) = fields_val.as_object() {
-                            for (fname, fval) in fmap {
-                                let (dtype, choices) = match fval {
-                                    Value::String(_) => (ValueDtype::List, None),
-                                    Value::Object(o) => {
-                                        let dt = o
-                                            .get("dtype")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| match s {
-                                                "str" => ValueDtype::Str,
-                                                _ => ValueDtype::List,
-                                            })
-                                            .unwrap_or(ValueDtype::List);
-                                        let ch =
-                                            o.get("choices").and_then(|v| v.as_array()).map(|a| {
-                                                a.iter()
-                                                    .filter_map(|v| v.as_str().map(String::from))
-                                                    .collect()
-                                            });
-                                        (dt, ch)
-                                    }
-                                    _ => (ValueDtype::List, None),
-                                };
-                                fields.push(StructureFieldInfo {
-                                    name: fname.clone(),
-                                    dtype,
-                                    choices,
-                                });
-                            }
-                        }
-                        info.structures.push(StructureInfo {
-                            name: parent.clone(),
-                            fields,
-                        });
-                    }
-                }
+                info.structures.push(StructureInfo {
+                    name: parent.clone(),
+                    fields,
+                });
             }
         }
 
@@ -928,20 +735,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn schema_document_alias_matches_extraction_schema() {
+        let doc: SchemaDocument = ExtractionSchema::default();
+        let _: ExtractionSchema = doc;
+    }
+
+    #[test]
     fn infer_metadata_entity_order() {
-        let v = json!({
+        let v: ExtractionSchema = serde_json::from_value(json!({
             "entities": { "a": "", "b": "" },
             "classifications": [],
             "json_structures": [],
             "relations": []
-        });
+        }))
+        .unwrap();
         let m = infer_metadata_from_schema(&v);
         assert_eq!(m.entity_order, vec!["a", "b"]);
     }
 
     #[test]
     fn parse_field_restaurant() {
-        let p = parse_field_spec(&json!("restaurant::str::Restaurant name")).unwrap();
+        let p = parse_field_spec(&FieldSpecSource::Str(
+            "restaurant::str::Restaurant name".into(),
+        ))
+        .unwrap();
         assert_eq!(p.name, "restaurant");
         assert_eq!(p.dtype, ValueDtype::Str);
         assert!(p.choices.is_none());
@@ -950,8 +767,10 @@ mod tests {
 
     #[test]
     fn parse_field_seating() {
-        let p =
-            parse_field_spec(&json!("seating::[indoor|outdoor|bar]::Seating preference")).unwrap();
+        let p = parse_field_spec(&FieldSpecSource::Str(
+            "seating::[indoor|outdoor|bar]::Seating preference".into(),
+        ))
+        .unwrap();
         assert_eq!(p.name, "seating");
         assert_eq!(p.dtype, ValueDtype::Str);
         assert_eq!(
@@ -963,8 +782,8 @@ mod tests {
 
     #[test]
     fn parse_field_dietary_list() {
-        let p = parse_field_spec(&json!(
-            "dietary::[vegetarian|vegan|gluten-free|none]::list::Dietary restrictions"
+        let p = parse_field_spec(&FieldSpecSource::Str(
+            "dietary::[vegetarian|vegan|gluten-free|none]::list::Dietary restrictions".into(),
         ))
         .unwrap();
         assert_eq!(p.name, "dietary");
@@ -975,11 +794,12 @@ mod tests {
 
     #[test]
     fn parse_field_dict() {
-        let p = parse_field_spec(&json!({
-            "name": "x",
-            "dtype": "str",
-            "choices": ["a", "b"],
-            "description": "d"
+        let p = parse_field_spec(&FieldSpecSource::Obj(FieldSpecObject {
+            name: "x".into(),
+            dtype: Some("str".into()),
+            choices: Some(vec!["a".into(), "b".into()]),
+            description: Some("d".into()),
+            validators: None,
         }))
         .unwrap();
         assert_eq!(p.name, "x");
@@ -991,24 +811,25 @@ mod tests {
     #[test]
     fn extract_json_structures_builds_schema() {
         let mut s = Schema::new();
-        let m = serde_json::json!({
+        let m: IndexMap<String, Vec<FieldSpecSource>> = serde_json::from_value(json!({
             "product_info": [
                 "name::str",
                 "price::str",
                 "features::list",
                 "availability::str::[in_stock|pre_order|sold_out]"
             ]
-        })
-        .as_object()
-        .unwrap()
-        .clone();
+        }))
+        .unwrap();
         s.extract_json_structures(&m).unwrap();
         let (v, meta) = s.build();
-        let arr = v["json_structures"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        let fields = arr[0]["product_info"].as_object().unwrap();
+        assert_eq!(v.json_structures.len(), 1);
+        let fields = v.json_structures[0]
+            .parents
+            .get("product_info")
+            .expect("product_info");
         assert!(fields.contains_key("name"));
-        assert!(fields["availability"].get("choices").is_some());
+        let av = fields.get("availability").expect("availability");
+        assert!(matches!(av, StructureField::Rich(b) if b.choices.is_some()));
         assert!(meta.field_orders.contains_key("product_info"));
     }
 
@@ -1061,7 +882,7 @@ mod tests {
 
     #[test]
     fn infer_metadata_parses_validators() {
-        let v = json!({
+        let v: ExtractionSchema = serde_json::from_value(json!({
             "entities": {},
             "classifications": [],
             "json_structures": [{
@@ -1075,7 +896,8 @@ mod tests {
                 }
             }],
             "relations": []
-        });
+        }))
+        .unwrap();
         let m = infer_metadata_from_schema(&v);
         let fm = m.field_metadata.get("form.code").expect("form.code");
         assert_eq!(fm.validators.len(), 1);
@@ -1085,12 +907,17 @@ mod tests {
 
     #[test]
     fn parse_field_spec_with_validators() {
-        let p = parse_field_spec(&json!({
-            "name": "email",
-            "dtype": "str",
-            "validators": [
-                { "pattern": "@", "mode": "partial" }
-            ]
+        let p = parse_field_spec(&FieldSpecSource::Obj(FieldSpecObject {
+            name: "email".into(),
+            dtype: Some("str".into()),
+            choices: None,
+            description: None,
+            validators: Some(vec![ValidatorSpec {
+                pattern: "@".into(),
+                mode: Some("partial".into()),
+                exclude: None,
+                case_insensitive: None,
+            }]),
         }))
         .unwrap();
         assert_eq!(p.name, "email");
@@ -1101,9 +928,18 @@ mod tests {
     #[test]
     fn introspect_entities_with_descriptions() {
         let mut s = Schema::new();
-        s.entities(json!({"person": "A person's name", "org": "An organization"}));
+        let mut m = IndexMap::new();
+        m.insert(
+            "person".into(),
+            EntityTypeConfigInput::DescriptionOnly("A person's name".into()),
+        );
+        m.insert(
+            "org".into(),
+            EntityTypeConfigInput::DescriptionOnly("An organization".into()),
+        );
+        s.entities(EntityTypesInput::WithMeta(m));
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.entities.len(), 2);
         let person = info.entities.iter().find(|e| e.name == "person").unwrap();
         assert_eq!(person.description.as_deref(), Some("A person's name"));
@@ -1112,9 +948,9 @@ mod tests {
     #[test]
     fn introspect_entities_simple() {
         let mut s = Schema::new();
-        s.entities(json!(["person", "org"]));
+        s.entities(EntityTypesInput::Many(vec!["person".into(), "org".into()]));
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.entities.len(), 2);
         assert!(info.entities[0].description.is_none());
     }
@@ -1122,9 +958,12 @@ mod tests {
     #[test]
     fn introspect_relations() {
         let mut s = Schema::new();
-        s.relations(json!(["works_for", "located_in"]));
+        s.relations(RelationTypesInput::Many(vec![
+            "works_for".into(),
+            "located_in".into(),
+        ]));
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.relations.len(), 2);
         assert_eq!(info.relations[0].name, "works_for");
         assert_eq!(info.relations[1].name, "located_in");
@@ -1133,10 +972,24 @@ mod tests {
     #[test]
     fn introspect_classifications() {
         let mut s = Schema::new();
-        s.classification("sentiment", json!(["positive", "negative"]), false, 0.5);
-        s.classification("topic", json!(["tech", "sports", "politics"]), true, 0.3);
+        s.classification(
+            "sentiment",
+            ClassificationLabelsInput::List(vec!["positive".into(), "negative".into()]),
+            false,
+            0.5,
+        );
+        s.classification(
+            "topic",
+            ClassificationLabelsInput::List(vec![
+                "tech".into(),
+                "sports".into(),
+                "politics".into(),
+            ]),
+            true,
+            0.3,
+        );
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.classifications.len(), 2);
         assert_eq!(info.classifications[0].task, "sentiment");
         assert_eq!(info.classifications[0].labels, vec!["positive", "negative"]);
@@ -1148,19 +1001,17 @@ mod tests {
     #[test]
     fn introspect_structures() {
         let mut s = Schema::new();
-        let m = json!({
+        let m: IndexMap<String, Vec<FieldSpecSource>> = serde_json::from_value(json!({
             "product_info": [
                 "name::str",
                 "features::list",
                 "availability::str::[in_stock|pre_order|sold_out]"
             ]
-        })
-        .as_object()
-        .unwrap()
-        .clone();
+        }))
+        .unwrap();
         s.extract_json_structures(&m).unwrap();
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.structures.len(), 1);
         assert_eq!(info.structures[0].name, "product_info");
         assert_eq!(info.structures[0].fields.len(), 3);
@@ -1179,11 +1030,14 @@ mod tests {
     #[test]
     fn introspect_multitask() {
         let mut s = Schema::new();
-        s.entities(json!(["person"]));
-        s.relations(json!(["works_for"]));
-        s.classification_simple("sentiment", json!(["pos", "neg"]));
+        s.entities(EntityTypesInput::Many(vec!["person".into()]));
+        s.relations(RelationTypesInput::Many(vec!["works_for".into()]));
+        s.classification_simple(
+            "sentiment",
+            ClassificationLabelsInput::List(vec!["pos".into(), "neg".into()]),
+        );
         let (v, _) = s.build();
-        let info = SchemaInfo::from_value(&v);
+        let info = SchemaInfo::from_schema(&v);
         assert_eq!(info.entities.len(), 1);
         assert_eq!(info.relations.len(), 1);
         assert_eq!(info.classifications.len(), 1);

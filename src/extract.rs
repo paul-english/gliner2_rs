@@ -1,12 +1,16 @@
 //! Multi-task extraction and `format_results` aligned with `gliner2.inference.engine`.
 
+mod output;
+
+pub use output::{ExtractionOutput, LabelConfidence, TaskValue};
+
 use crate::engine::Gliner2Engine;
 use crate::preprocess::{PreprocessedInput, TaskType, collate_preprocessed};
 use crate::processor::SchemaTransformer;
-use crate::schema::ExtractionMetadata;
+use crate::schema::{ClassificationConfig, ExtractionMetadata, ExtractionSchema, StructureField};
 use anyhow::{Context, Result};
-use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use indexmap::IndexMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct ExtractOptions {
@@ -37,12 +41,12 @@ impl Default for ExtractOptions {
 pub enum BatchSchemaMode<'a> {
     /// One schema and metadata shared by every text in the batch.
     Shared {
-        schema: &'a Value,
+        schema: &'a ExtractionSchema,
         meta: &'a ExtractionMetadata,
     },
     /// Per-text schema and metadata (`len` must match `texts.len()`).
     PerSample {
-        schemas: &'a [Value],
+        schemas: &'a [ExtractionSchema],
         metas: &'a [ExtractionMetadata],
     },
 }
@@ -64,7 +68,7 @@ pub fn extract_from_preprocessed<E: Gliner2Engine>(
     span_rep: Option<&E::Tensor>,
     meta: &ExtractionMetadata,
     opts: &ExtractOptions,
-) -> Result<Value> {
+) -> Result<ExtractionOutput> {
     let span_for_tasks: Option<&E::Tensor> = if sample_needs_span_rep(pre) {
         Some(span_rep.context("extract_from_preprocessed: span_rep required for span tasks")?)
     } else {
@@ -75,7 +79,7 @@ pub fn extract_from_preprocessed<E: Gliner2Engine>(
     let text_len = pre.start_mappings.len();
     let len_prefix = pre.len_prefix;
 
-    let mut raw: Map<String, Value> = Map::new();
+    let mut raw: BTreeMap<String, TaskValue> = BTreeMap::new();
 
     for (task_i, task_type) in pre.task_types.iter().enumerate() {
         let positions = pre
@@ -180,7 +184,7 @@ pub fn extract_from_preprocessed<E: Gliner2Engine>(
         }
     }
 
-    let out = if opts.format_results {
+    let fields = if opts.format_results {
         format_results(
             raw,
             opts.include_confidence,
@@ -188,9 +192,9 @@ pub fn extract_from_preprocessed<E: Gliner2Engine>(
             &meta.classification_tasks,
         )
     } else {
-        Value::Object(raw)
+        raw
     };
-    Ok(out)
+    Ok(ExtractionOutput { fields })
 }
 
 /// End-to-end extract: preprocess → encode → heads → optional `format_results`.
@@ -198,10 +202,10 @@ pub fn extract_with_schema<E: Gliner2Engine>(
     engine: &E,
     transformer: &SchemaTransformer,
     text: &str,
-    schema: &Value,
+    schema: &ExtractionSchema,
     meta: &ExtractionMetadata,
     opts: &ExtractOptions,
-) -> Result<Value> {
+) -> Result<ExtractionOutput> {
     let pre = transformer.transform_extract(text, schema, opts.max_len)?;
     let (input_ids, attention_mask) = engine.single_sample_inputs(&pre.input_ids)?;
 
@@ -230,7 +234,7 @@ pub fn batch_extract_streaming<E, F>(
 ) -> Result<()>
 where
     E: Gliner2Engine,
-    F: FnMut(usize, Vec<Value>) -> Result<()>,
+    F: FnMut(usize, Vec<ExtractionOutput>) -> Result<()>,
 {
     use rayon::prelude::*;
 
@@ -336,7 +340,7 @@ where
 
         // -- Phase B: parallel per-record decode (into_par_iter: each thread owns its tensors) --
         let samples = &batch.samples;
-        let decoded: Vec<Result<Value>> = sample_data
+        let decoded: Vec<Result<ExtractionOutput>> = sample_data
             .into_par_iter()
             .map(|(i, last_h, span)| {
                 let pre = &samples[i];
@@ -358,7 +362,7 @@ where
     Ok(())
 }
 
-/// Collect all extraction results into a `Vec<Value>`.
+/// Collect all extraction results into a `Vec<ExtractionOutput>`.
 ///
 /// This is a convenience wrapper around [`batch_extract_streaming`] for
 /// callers that need all results in memory (e.g. for further processing).
@@ -368,7 +372,7 @@ pub fn batch_extract<E: Gliner2Engine>(
     texts: &[String],
     mode: BatchSchemaMode<'_>,
     opts: &ExtractOptions,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<ExtractionOutput>> {
     let mut all_out = Vec::with_capacity(texts.len());
     batch_extract_streaming(engine, transformer, texts, mode, opts, |_offset, batch| {
         all_out.extend(batch);
@@ -398,26 +402,17 @@ fn field_names_from_schema_tokens(tokens: &[String]) -> Vec<String> {
     out
 }
 
-fn build_cls_fields(schema: &Value) -> HashMap<String, Vec<String>> {
+fn build_cls_fields(schema: &ExtractionSchema) -> HashMap<String, Vec<String>> {
     let mut m = HashMap::new();
-    let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) else {
-        return m;
-    };
-    for st in arr {
-        let Some(obj) = st.as_object() else { continue };
-        for (parent, fields) in obj {
-            let Some(fmap) = fields.as_object() else {
-                continue;
-            };
+    for block in &schema.json_structures {
+        for (parent, fmap) in &block.parents {
             for (fname, fval) in fmap {
-                if fval.get("value").is_some()
-                    && let Some(choices) = fval.get("choices").and_then(|c| c.as_array())
-                {
-                    let ch: Vec<String> = choices
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    m.insert(format!("{parent}.{fname}"), ch);
+                if let StructureField::Rich(body) = fval {
+                    if body.value.is_some() {
+                        if let Some(ch) = &body.choices {
+                            m.insert(format!("{parent}.{fname}"), ch.clone());
+                        }
+                    }
                 }
             }
         }
@@ -426,9 +421,9 @@ fn build_cls_fields(schema: &Value) -> HashMap<String, Vec<String>> {
 }
 
 fn extract_classification<E: Gliner2Engine>(
-    results: &mut Map<String, Value>,
+    results: &mut BTreeMap<String, TaskValue>,
     schema_tokens: &[String],
-    schema: &Value,
+    schema: &ExtractionSchema,
     engine: &E,
     embs: &E::Tensor,
     include_confidence: bool,
@@ -444,27 +439,10 @@ fn extract_classification<E: Gliner2Engine>(
     let cls_embeds = engine.tensor_narrow0(embs, 1, n - 1)?;
     let logits = engine.classifier_logits(&cls_embeds)?;
     let logits_v = engine.tensor_logits_1d(&logits)?;
-    let labels: Vec<String> = cls
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let multi = cls
-        .get("multi_label")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let cls_threshold = cls
-        .get("cls_threshold")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.5) as f32;
-    let class_act = cls
-        .get("class_act")
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
+    let labels = cls.labels.clone();
+    let multi = cls.multi_label;
+    let cls_threshold = cls.cls_threshold;
+    let class_act = cls.class_act.as_deref().unwrap_or("auto");
 
     let schema_name = prompt.clone();
 
@@ -488,14 +466,17 @@ fn extract_classification<E: Gliner2Engine>(
         results.insert(
             schema_name,
             if include_confidence {
-                json!(
+                TaskValue::LabelConfidenceList(
                     chosen
                         .into_iter()
-                        .map(|(l, c)| json!({"label": l, "confidence": c}))
-                        .collect::<Vec<_>>()
+                        .map(|(l, c)| LabelConfidence {
+                            label: l,
+                            confidence: c,
+                        })
+                        .collect(),
                 )
             } else {
-                json!(chosen.into_iter().map(|(l, _)| l).collect::<Vec<_>>())
+                TaskValue::StringArray(chosen.into_iter().map(|(l, _)| l).collect())
             },
         );
     } else {
@@ -510,9 +491,12 @@ fn extract_classification<E: Gliner2Engine>(
         results.insert(
             schema_name,
             if include_confidence {
-                json!({"label": label, "confidence": conf})
+                TaskValue::LabelConfidence(LabelConfidence {
+                    label,
+                    confidence: conf,
+                })
             } else {
-                Value::String(label)
+                TaskValue::String(label)
             },
         );
     }
@@ -535,23 +519,19 @@ fn argmax_f32(p: &[f32]) -> usize {
 }
 
 fn find_classification_config<'a>(
-    schema: &'a Value,
+    schema: &'a ExtractionSchema,
     prompt: &str,
-) -> Option<&'a Map<String, Value>> {
-    let arr = schema.get("classifications")?.as_array()?;
-    for c in arr {
-        let task = c.get("task")?.as_str()?;
-        if prompt.starts_with(task) {
-            return c.as_object();
-        }
-    }
-    None
+) -> Option<&'a ClassificationConfig> {
+    schema
+        .classifications
+        .iter()
+        .find(|c| prompt.starts_with(&c.task))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn extract_span_task<E: Gliner2Engine>(
     engine: &E,
-    results: &mut Map<String, Value>,
+    results: &mut BTreeMap<String, TaskValue>,
     schema_name: &str,
     schema_tokens: &[String],
     embs: &E::Tensor,
@@ -655,15 +635,15 @@ fn extract_span_task<E: Gliner2Engine>(
 }
 
 fn insert_empty_span_result(
-    results: &mut Map<String, Value>,
+    results: &mut BTreeMap<String, TaskValue>,
     schema_name: &str,
     task_type: &TaskType,
 ) {
     let v = match task_type {
-        TaskType::Entities => json!([]),
-        TaskType::Relations => json!([]),
-        TaskType::JsonStructures => json!([]),
-        TaskType::Classifications => json!(null),
+        TaskType::Entities | TaskType::Relations | TaskType::JsonStructures => {
+            TaskValue::ObjectArray(vec![])
+        }
+        TaskType::Classifications => TaskValue::Null,
     };
     results.insert(schema_name.to_string(), v);
 }
@@ -684,10 +664,10 @@ fn extract_entities_inner(
     meta: &ExtractionMetadata,
     include_confidence: bool,
     include_spans: bool,
-) -> Result<Value> {
+) -> Result<TaskValue> {
     let b = 0usize;
     let slice_l = l_words.saturating_sub(text_len);
-    let mut entity_map = Map::new();
+    let mut entity_map: BTreeMap<String, TaskValue> = BTreeMap::new();
     let order: Vec<String> = if meta.entity_order.is_empty() {
         field_names.to_vec()
     } else {
@@ -723,48 +703,55 @@ fn extract_entities_inner(
         if dtype_list {
             entity_map.insert(
                 name,
-                json!(
+                TaskValue::Array(
                     formatted
                         .into_iter()
-                        .map(|(t, c, st, en)| span_to_entity_json(
-                            &t,
-                            c,
-                            st,
-                            en,
-                            include_confidence,
-                            include_spans
-                        ))
-                        .collect::<Vec<Value>>()
+                        .map(|(t, c, st, en)| {
+                            span_to_entity_tv(&t, c, st, en, include_confidence, include_spans)
+                        })
+                        .collect(),
                 ),
             );
         } else {
             let v = if let Some((t, c, st, en)) = spans.first() {
-                span_to_entity_json(t, *c, *st, *en, include_confidence, include_spans)
+                span_to_entity_tv(t, *c, *st, *en, include_confidence, include_spans)
             } else if include_spans || include_confidence {
-                Value::Null
+                TaskValue::Null
             } else {
-                Value::String(String::new())
+                TaskValue::String(String::new())
             };
             entity_map.insert(name, v);
         }
     }
 
-    Ok(json!([Value::Object(entity_map)]))
+    Ok(TaskValue::ObjectArray(vec![entity_map]))
 }
 
-fn span_to_entity_json(
+fn span_to_entity_tv(
     text: &str,
     conf: f32,
     start: usize,
     end: usize,
     include_confidence: bool,
     include_spans: bool,
-) -> Value {
+) -> TaskValue {
     match (include_spans, include_confidence) {
-        (true, true) => json!({"text": text, "confidence": conf, "start": start, "end": end}),
-        (true, false) => json!({"text": text, "start": start, "end": end}),
-        (false, true) => json!({"text": text, "confidence": conf}),
-        (false, false) => Value::String(text.to_string()),
+        (true, true) => TaskValue::Object(BTreeMap::from([
+            ("text".into(), TaskValue::String(text.to_string())),
+            ("confidence".into(), TaskValue::F64(conf as f64)),
+            ("start".into(), TaskValue::U64(start as u64)),
+            ("end".into(), TaskValue::U64(end as u64)),
+        ])),
+        (true, false) => TaskValue::Object(BTreeMap::from([
+            ("text".into(), TaskValue::String(text.to_string())),
+            ("start".into(), TaskValue::U64(start as u64)),
+            ("end".into(), TaskValue::U64(end as u64)),
+        ])),
+        (false, true) => TaskValue::Object(BTreeMap::from([
+            ("text".into(), TaskValue::String(text.to_string())),
+            ("confidence".into(), TaskValue::F64(conf as f64)),
+        ])),
+        (false, false) => TaskValue::String(text.to_string()),
     }
 }
 
@@ -868,7 +855,7 @@ fn extract_relations_inner(
     meta: &ExtractionMetadata,
     include_confidence: bool,
     include_spans: bool,
-) -> Result<Value> {
+) -> Result<TaskValue> {
     let slice_l = l_words.saturating_sub(text_len);
     let rel_threshold = meta
         .relation_metadata
@@ -881,7 +868,7 @@ fn extract_relations_inner(
         .cloned()
         .unwrap_or_else(|| field_names.to_vec());
 
-    let mut instances = Vec::new();
+    let mut instances: Vec<TaskValue> = Vec::new();
     for inst in 0..pred_count {
         let mut values: Vec<Option<String>> = Vec::new();
         let mut field_data: Vec<Option<(String, f32, usize, usize)>> = Vec::new();
@@ -913,27 +900,45 @@ fn extract_relations_inner(
             let fd0 = field_data[0].as_ref().unwrap();
             let fd1 = field_data[1].as_ref().unwrap();
             let tup = if include_spans && include_confidence {
-                json!({
-                    "head": {"text": fd0.0, "confidence": fd0.1, "start": fd0.2, "end": fd0.3},
-                    "tail": {"text": fd1.0, "confidence": fd1.1, "start": fd1.2, "end": fd1.3},
-                })
+                TaskValue::Object(BTreeMap::from([
+                    (
+                        "head".into(),
+                        span_to_entity_tv(&fd0.0, fd0.1, fd0.2, fd0.3, true, true),
+                    ),
+                    (
+                        "tail".into(),
+                        span_to_entity_tv(&fd1.0, fd1.1, fd1.2, fd1.3, true, true),
+                    ),
+                ]))
             } else if include_spans {
-                json!({
-                    "head": {"text": fd0.0, "start": fd0.2, "end": fd0.3},
-                    "tail": {"text": fd1.0, "start": fd1.2, "end": fd1.3},
-                })
+                TaskValue::Object(BTreeMap::from([
+                    (
+                        "head".into(),
+                        span_to_entity_tv(&fd0.0, fd0.1, fd0.2, fd0.3, false, true),
+                    ),
+                    (
+                        "tail".into(),
+                        span_to_entity_tv(&fd1.0, fd1.1, fd1.2, fd1.3, false, true),
+                    ),
+                ]))
             } else if include_confidence {
-                json!({
-                    "head": {"text": fd0.0, "confidence": fd0.1},
-                    "tail": {"text": fd1.0, "confidence": fd1.1},
-                })
+                TaskValue::Object(BTreeMap::from([
+                    (
+                        "head".into(),
+                        span_to_entity_tv(&fd0.0, fd0.1, fd0.2, fd0.3, true, false),
+                    ),
+                    (
+                        "tail".into(),
+                        span_to_entity_tv(&fd1.0, fd1.1, fd1.2, fd1.3, true, false),
+                    ),
+                ]))
             } else {
-                json!([values[0].clone().unwrap(), values[1].clone().unwrap()])
+                TaskValue::StringArray(vec![values[0].clone().unwrap(), values[1].clone().unwrap()])
             };
             instances.push(tup);
         }
     }
-    Ok(Value::Array(instances))
+    Ok(TaskValue::Array(instances))
 }
 
 fn find_choice_idx(choice: &str, tokens: &[String]) -> isize {
@@ -965,7 +970,7 @@ fn extract_structures_inner(
     cls_fields: &HashMap<String, Vec<String>>,
     include_confidence: bool,
     include_spans: bool,
-) -> Result<Value> {
+) -> Result<TaskValue> {
     let slice_l = l_words.saturating_sub(text_len);
     let ordered: Vec<String> = meta
         .field_orders
@@ -973,9 +978,9 @@ fn extract_structures_inner(
         .cloned()
         .unwrap_or_else(|| field_names.to_vec());
 
-    let mut instances = Vec::new();
+    let mut instances: Vec<BTreeMap<String, TaskValue>> = Vec::new();
     for inst in 0..pred_count {
-        let mut instance = Map::new();
+        let mut instance: BTreeMap<String, TaskValue> = BTreeMap::new();
         for fname in &ordered {
             if !field_names.contains(fname) {
                 continue;
@@ -991,7 +996,7 @@ fn extract_structures_inner(
             if let Some(choices) = cls_fields.get(&field_key) {
                 let plane = &span_scores[inst][fidx];
                 let prefix_len = l_words.saturating_sub(text_len);
-                let mut selected = Vec::new();
+                let mut selected: Vec<TaskValue> = Vec::new();
                 let mut seen = HashSet::new();
                 if dtype_list {
                     for choice in choices {
@@ -1007,14 +1012,17 @@ fn extract_structures_inner(
                             let score = row.first().copied().unwrap_or(0.);
                             if score >= field_threshold {
                                 if include_confidence {
-                                    selected.push(json!({"text": choice, "confidence": score}));
+                                    selected.push(TaskValue::Object(BTreeMap::from([
+                                        ("text".into(), TaskValue::String(choice.clone())),
+                                        ("confidence".into(), TaskValue::F64(score as f64)),
+                                    ])));
                                 } else {
-                                    selected.push(Value::String(choice.clone()));
+                                    selected.push(TaskValue::String(choice.clone()));
                                 }
                             }
                         }
                     }
-                    instance.insert(fname.clone(), Value::Array(selected));
+                    instance.insert(fname.clone(), TaskValue::Array(selected));
                 } else {
                     let mut best: Option<&str> = None;
                     let mut best_score = -1f32;
@@ -1035,15 +1043,18 @@ fn extract_structures_inner(
                     let v = if let Some(b) = best {
                         if best_score >= field_threshold {
                             if include_confidence {
-                                json!({"text": b, "confidence": best_score})
+                                TaskValue::Object(BTreeMap::from([
+                                    ("text".into(), TaskValue::String(b.to_string())),
+                                    ("confidence".into(), TaskValue::F64(best_score as f64)),
+                                ]))
                             } else {
-                                Value::String(b.to_string())
+                                TaskValue::String(b.to_string())
                             }
                         } else {
-                            Value::Null
+                            TaskValue::Null
                         }
                     } else {
-                        Value::Null
+                        TaskValue::Null
                     };
                     instance.insert(fname.clone(), v);
                 }
@@ -1065,44 +1076,56 @@ fn extract_structures_inner(
                 }
                 let formatted = format_spans(&spans, include_confidence, include_spans);
                 if dtype_list {
-                    let arr: Vec<Value> = formatted
+                    let arr: Vec<TaskValue> = formatted
                         .into_iter()
                         .map(|(t, c, st, en)| {
-                            span_to_entity_json(&t, c, st, en, include_confidence, include_spans)
+                            span_to_entity_tv(&t, c, st, en, include_confidence, include_spans)
                         })
                         .collect();
-                    instance.insert(fname.clone(), Value::Array(arr));
+                    instance.insert(fname.clone(), TaskValue::Array(arr));
                 } else {
                     let v = if let Some((t, c, st, en)) = formatted.first() {
-                        span_to_entity_json(t, *c, *st, *en, include_confidence, include_spans)
+                        span_to_entity_tv(t, *c, *st, *en, include_confidence, include_spans)
                     } else {
-                        Value::Null
+                        TaskValue::Null
                     };
                     instance.insert(fname.clone(), v);
                 }
             }
         }
         let has_content = instance.values().any(|v| match v {
-            Value::Null => false,
-            Value::Array(a) => !a.is_empty(),
+            TaskValue::Null => false,
+            TaskValue::Array(a) => !a.is_empty(),
+            TaskValue::ObjectArray(a) => !a.is_empty(),
             _ => true,
         });
         if has_content {
-            instances.push(Value::Object(instance));
+            instances.push(instance);
         }
     }
-    Ok(Value::Array(instances))
+    Ok(TaskValue::ObjectArray(instances))
 }
 
 fn format_results(
-    results: Map<String, Value>,
+    results: BTreeMap<String, TaskValue>,
     include_confidence: bool,
     requested_relations: &[String],
     classification_tasks: &[String],
-) -> Value {
-    let mut formatted = Map::new();
-    let mut relations = Map::new();
+) -> BTreeMap<String, TaskValue> {
+    let mut formatted: BTreeMap<String, TaskValue> = BTreeMap::new();
+    let mut relations: BTreeMap<String, TaskValue> = BTreeMap::new();
     let cls_set: HashSet<&str> = classification_tasks.iter().map(|s| s.as_str()).collect();
+
+    fn is_relation_shape(v: &TaskValue) -> bool {
+        match v {
+            TaskValue::Array(a) if !a.is_empty() => match a.first() {
+                Some(TaskValue::StringArray(inner)) => inner.len() == 2,
+                Some(TaskValue::Object(o)) => o.contains_key("head") && o.contains_key("tail"),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 
     for (key, value) in results.into_iter() {
         let is_classification = cls_set.contains(key.as_str());
@@ -1110,78 +1133,92 @@ fn format_results(
             if requested_relations.iter().any(|r| r == &key) {
                 true
             } else {
-                match &value {
-                    Value::Array(a) if !a.is_empty() => match a.first() {
-                        Some(Value::Array(inner)) if inner.len() == 2 => true,
-                        Some(Value::Object(o))
-                            if o.contains_key("head") && o.contains_key("tail") =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                }
+                is_relation_shape(&value)
             }
         } else {
             false
         };
 
         if is_classification {
-            match &value {
-                Value::Array(a) => {
+            let out = match value {
+                TaskValue::LabelConfidenceList(list) => {
                     if include_confidence {
-                        formatted.insert(key, value);
+                        TaskValue::LabelConfidenceList(list)
                     } else {
-                        let labs: Vec<Value> = a
-                            .iter()
-                            .filter_map(|x| x.as_str().map(|s| Value::String(s.to_string())))
+                        TaskValue::StringArray(list.into_iter().map(|x| x.label).collect())
+                    }
+                }
+                TaskValue::StringArray(a) => TaskValue::StringArray(a),
+                TaskValue::Array(a) => {
+                    if include_confidence {
+                        TaskValue::Array(a)
+                    } else {
+                        let labs: Vec<String> = a
+                            .into_iter()
+                            .filter_map(|x| match x {
+                                TaskValue::String(s) => Some(s),
+                                TaskValue::LabelConfidence(l) => Some(l.label),
+                                TaskValue::Object(mut o) => {
+                                    o.remove("label").and_then(|v| match v {
+                                        TaskValue::String(s) => Some(s),
+                                        _ => None,
+                                    })
+                                }
+                                _ => None,
+                            })
                             .collect();
-                        formatted.insert(key, Value::Array(labs));
+                        TaskValue::StringArray(labs)
                     }
                 }
-                Value::Object(o) if include_confidence => {
-                    formatted.insert(key, value);
-                }
-                Value::Object(o) => {
-                    if let Some(l) = o.get("label") {
-                        formatted.insert(key, l.clone());
+                TaskValue::LabelConfidence(l) => {
+                    if include_confidence {
+                        TaskValue::LabelConfidence(l)
                     } else {
-                        formatted.insert(key, value);
+                        TaskValue::String(l.label)
                     }
                 }
-                _ => {
-                    formatted.insert(key, value);
+                TaskValue::Object(o) if include_confidence => TaskValue::Object(o.clone()),
+                TaskValue::Object(o) => {
+                    if let Some(l) = o.get("label").cloned() {
+                        l
+                    } else {
+                        TaskValue::Object(o.clone())
+                    }
                 }
-            }
+                other => other,
+            };
+            formatted.insert(key, out);
         } else if is_relation {
-            if let Value::Array(a) = value {
-                relations.insert(key, Value::Array(a));
+            if let TaskValue::Array(a) = value {
+                relations.insert(key, TaskValue::Array(a));
             } else {
-                relations.insert(key, json!([]));
+                relations.insert(key, TaskValue::Array(vec![]));
             }
-        } else if let Value::Array(a) = value {
+        } else if let TaskValue::ObjectArray(a) = value {
             if a.is_empty() {
                 if key == "entities" {
-                    formatted.insert(key, json!({}));
+                    formatted.insert(key, TaskValue::Object(BTreeMap::new()));
                 } else {
-                    formatted.insert(key, Value::Array(a));
+                    formatted.insert(key, TaskValue::ObjectArray(a));
                 }
-            } else if let Some(Value::Object(ent)) = a.first() {
+            } else if let Some(ent) = a.first() {
                 if key == "entities" {
                     formatted.insert(key, format_entity_dict(ent, include_confidence));
                 } else {
-                    let mapped: Vec<Value> = a
+                    let mapped: Vec<BTreeMap<String, TaskValue>> = a
                         .iter()
-                        .filter_map(|v| {
-                            v.as_object()
-                                .map(|o| format_struct_obj(o, include_confidence))
-                        })
+                        .map(|o| format_struct_obj(o, include_confidence))
                         .collect();
-                    formatted.insert(key, Value::Array(mapped));
+                    formatted.insert(key, TaskValue::ObjectArray(mapped));
                 }
             } else {
-                formatted.insert(key, Value::Array(a));
+                formatted.insert(key, TaskValue::ObjectArray(a));
+            }
+        } else if let TaskValue::Array(a) = value {
+            if a.is_empty() && key == "entities" {
+                formatted.insert(key, TaskValue::Object(BTreeMap::new()));
+            } else {
+                formatted.insert(key, TaskValue::Array(a));
             }
         } else {
             formatted.insert(key, value);
@@ -1190,33 +1227,36 @@ fn format_results(
 
     for rel in requested_relations {
         if !relations.contains_key(rel.as_str()) {
-            relations.insert(rel.clone(), json!([]));
+            relations.insert(rel.clone(), TaskValue::Array(vec![]));
         }
     }
 
     if !relations.is_empty() {
-        formatted.insert("relation_extraction".into(), Value::Object(relations));
+        formatted.insert("relation_extraction".into(), TaskValue::Object(relations));
     }
 
-    Value::Object(formatted)
+    formatted
 }
 
-fn format_entity_dict(ent: &Map<String, Value>, include_confidence: bool) -> Value {
-    let mut out = Map::new();
+fn format_entity_dict(ent: &BTreeMap<String, TaskValue>, include_confidence: bool) -> TaskValue {
+    let mut out: BTreeMap<String, TaskValue> = BTreeMap::new();
     for (k, v) in ent {
         let cleaned = match v {
-            Value::Array(items) => {
-                let mut unique = Vec::new();
+            TaskValue::Array(items) => {
+                let mut unique: Vec<TaskValue> = Vec::new();
                 let mut seen = HashSet::new();
                 for it in items {
                     let text_key = match it {
-                        Value::String(s) => Some((
+                        TaskValue::String(s) => Some((
                             s.to_lowercase(),
                             format_string_list_item(s, include_confidence),
                         )),
-                        Value::Object(o) => o.get("text").and_then(|t| t.as_str()).map(|t| {
-                            let lk = t.to_lowercase();
-                            (lk.clone(), it.clone())
+                        TaskValue::Object(o) => o.get("text").and_then(|t| match t {
+                            TaskValue::String(ts) => {
+                                let lk = ts.to_lowercase();
+                                Some((lk.clone(), it.clone()))
+                            }
+                            _ => None,
                         }),
                         _ => None,
                     };
@@ -1226,45 +1266,49 @@ fn format_entity_dict(ent: &Map<String, Value>, include_confidence: bool) -> Val
                         unique.push(val);
                     }
                 }
-                Value::Array(unique)
+                TaskValue::Array(unique)
             }
             _ => v.clone(),
         };
         out.insert(k.clone(), cleaned);
     }
-    Value::Object(out)
+    TaskValue::Object(out)
 }
 
-fn format_string_list_item(s: &str, include_confidence: bool) -> Value {
+fn format_string_list_item(s: &str, include_confidence: bool) -> TaskValue {
     if include_confidence {
-        json!({"text": s, "confidence": 1.0})
+        TaskValue::Object(BTreeMap::from([
+            ("text".into(), TaskValue::String(s.to_string())),
+            ("confidence".into(), TaskValue::F64(1.0)),
+        ]))
     } else {
-        Value::String(s.to_string())
+        TaskValue::String(s.to_string())
     }
 }
 
-fn format_struct_obj(o: &Map<String, Value>, include_confidence: bool) -> Value {
-    let mut m = Map::new();
+fn format_struct_obj(
+    o: &BTreeMap<String, TaskValue>,
+    include_confidence: bool,
+) -> BTreeMap<String, TaskValue> {
+    let mut m = BTreeMap::new();
     for (k, v) in o {
         m.insert(k.clone(), format_struct_value(v, include_confidence));
     }
-    Value::Object(m)
+    m
 }
 
-fn format_struct_value(v: &Value, include_confidence: bool) -> Value {
+fn format_struct_value(v: &TaskValue, include_confidence: bool) -> TaskValue {
     match v {
-        Value::Array(a) => {
-            let mut out = Vec::new();
-            for it in a {
-                out.push(format_struct_value(it, include_confidence));
-            }
-            Value::Array(out)
-        }
-        Value::Object(o) => {
+        TaskValue::Array(a) => TaskValue::Array(
+            a.iter()
+                .map(|it| format_struct_value(it, include_confidence))
+                .collect(),
+        ),
+        TaskValue::Object(o) => {
             if o.contains_key("text") && o.contains_key("confidence") && !include_confidence {
-                o.get("text").cloned().unwrap_or(Value::Null)
+                o.get("text").cloned().unwrap_or(TaskValue::Null)
             } else {
-                Value::Object(o.clone())
+                TaskValue::Object(o.clone())
             }
         }
         _ => v.clone(),
@@ -1279,10 +1323,10 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 text: &str,
-                schema: &Value,
+                schema: &crate::schema::ExtractionSchema,
                 meta: &ExtractionMetadata,
                 opts: &ExtractOptions,
-            ) -> Result<Value> {
+            ) -> Result<ExtractionOutput> {
                 extract_with_schema(self, transformer, text, schema, meta, opts)
             }
 
@@ -1291,10 +1335,10 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 texts: &[String],
-                schema: &Value,
+                schema: &crate::schema::ExtractionSchema,
                 meta: &ExtractionMetadata,
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
+            ) -> Result<Vec<ExtractionOutput>> {
                 batch_extract(
                     self,
                     transformer,
@@ -1309,10 +1353,10 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 texts: &[String],
-                schemas: &[Value],
+                schemas: &[crate::schema::ExtractionSchema],
                 metas: &[ExtractionMetadata],
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
+            ) -> Result<Vec<ExtractionOutput>> {
                 batch_extract(
                     self,
                     transformer,
@@ -1328,10 +1372,9 @@ macro_rules! impl_gliner2_api {
                 texts: &[String],
                 entity_types: &[String],
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
+            ) -> Result<Vec<ExtractionOutput>> {
                 let mut s = crate::schema::Schema::new();
-                let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
-                s.entities(Value::Array(types));
+                s.entities(crate::schema::EntityTypesInput::Many(entity_types.to_vec()));
                 let (schema_val, meta) = s.build();
                 self.batch_extract(transformer, texts, &schema_val, &meta, opts)
             }
@@ -1341,9 +1384,9 @@ macro_rules! impl_gliner2_api {
                 transformer: &SchemaTransformer,
                 texts: &[String],
                 task: &str,
-                labels: Value,
+                labels: crate::schema::ClassificationLabelsInput,
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
+            ) -> Result<Vec<ExtractionOutput>> {
                 let mut s = crate::schema::Schema::new();
                 s.classification_simple(task, labels);
                 let (schema_val, meta) = s.build();
@@ -1354,9 +1397,9 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 texts: &[String],
-                relation_types: Value,
+                relation_types: crate::schema::RelationTypesInput,
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
+            ) -> Result<Vec<ExtractionOutput>> {
                 let mut s = crate::schema::Schema::new();
                 s.relations(relation_types);
                 let (schema_val, meta) = s.build();
@@ -1367,14 +1410,11 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 texts: &[String],
-                structures: &Value,
+                structures: &IndexMap<String, Vec<crate::schema::FieldSpecSource>>,
                 opts: &ExtractOptions,
-            ) -> Result<Vec<Value>> {
-                let obj = structures.as_object().context(
-                    "batch_extract_json: structures must be a JSON object (parent → field spec array)",
-                )?;
+            ) -> Result<Vec<ExtractionOutput>> {
                 let mut s = crate::schema::Schema::new();
-                s.extract_json_structures(obj)?;
+                s.extract_json_structures(structures)?;
                 let (schema_val, meta) = s.build();
                 self.batch_extract(transformer, texts, &schema_val, &meta, opts)
             }
@@ -1385,10 +1425,9 @@ macro_rules! impl_gliner2_api {
                 text: &str,
                 entity_types: &[String],
                 opts: &ExtractOptions,
-            ) -> Result<Value> {
+            ) -> Result<ExtractionOutput> {
                 let mut s = crate::schema::Schema::new();
-                let types: Vec<Value> = entity_types.iter().map(|t| json!(t)).collect();
-                s.entities(Value::Array(types));
+                s.entities(crate::schema::EntityTypesInput::Many(entity_types.to_vec()));
                 let (schema_val, meta) = s.build();
                 self.extract(transformer, text, &schema_val, &meta, opts)
             }
@@ -1398,9 +1437,9 @@ macro_rules! impl_gliner2_api {
                 transformer: &SchemaTransformer,
                 text: &str,
                 task: &str,
-                labels: Value,
+                labels: crate::schema::ClassificationLabelsInput,
                 opts: &ExtractOptions,
-            ) -> Result<Value> {
+            ) -> Result<ExtractionOutput> {
                 let mut s = crate::schema::Schema::new();
                 s.classification_simple(task, labels);
                 let (schema_val, meta) = s.build();
@@ -1411,9 +1450,9 @@ macro_rules! impl_gliner2_api {
                 &self,
                 transformer: &SchemaTransformer,
                 text: &str,
-                relation_types: Value,
+                relation_types: crate::schema::RelationTypesInput,
                 opts: &ExtractOptions,
-            ) -> Result<Value> {
+            ) -> Result<ExtractionOutput> {
                 let mut s = crate::schema::Schema::new();
                 s.relations(relation_types);
                 let (schema_val, meta) = s.build();
@@ -1421,20 +1460,15 @@ macro_rules! impl_gliner2_api {
             }
 
             /// Structured extraction using string or object field specs (Python `GLiNER2.extract_json`).
-            ///
-            /// `structures` must be a JSON object: parent name → array of specs (`"name::dtype::[a|b]::desc"` or object).
             pub fn extract_json(
                 &self,
                 transformer: &SchemaTransformer,
                 text: &str,
-                structures: &Value,
+                structures: &IndexMap<String, Vec<crate::schema::FieldSpecSource>>,
                 opts: &ExtractOptions,
-            ) -> Result<Value> {
-                let obj = structures.as_object().context(
-                    "extract_json: structures must be a JSON object (parent → field spec array)",
-                )?;
+            ) -> Result<ExtractionOutput> {
                 let mut s = crate::schema::Schema::new();
-                s.extract_json_structures(obj)?;
+                s.extract_json_structures(structures)?;
                 let (schema_val, meta) = s.build();
                 self.extract(transformer, text, &schema_val, &meta, opts)
             }

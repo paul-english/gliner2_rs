@@ -6,9 +6,13 @@ use clap::{Parser, Subcommand};
 use gliner2::CandleExtractor;
 use gliner2::SchemaInfo;
 use gliner2::config::{ModelFiles, download_model};
+use gliner2::schema::{
+    ClassificationLabelsInput, EntityTypesInput, ExtractionSchema, FieldSpecSource,
+    RelationTypesInput,
+};
 use gliner2::{
-    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract_streaming,
-    infer_metadata_from_schema,
+    BatchSchemaMode, ExtractOptions, ExtractionOutput, ExtractorConfig, IndexMap,
+    SchemaTransformer, batch_extract_streaming, infer_metadata_from_schema,
 };
 #[cfg(feature = "tch")]
 use gliner2::{TchExtractor, parse_tch_device};
@@ -278,7 +282,8 @@ fn show_status() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 struct Record {
-    id: Option<Value>,
+    /// Canonical string form of the source id (JSON numbers and booleans are stringified).
+    id: Option<String>,
     text: String,
 }
 
@@ -533,7 +538,7 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
 
     // Set up Label Studio project if requested
     let ls_state = if let Some((ref project_name, ref url, ref api_key)) = ls_config {
-        let info = SchemaInfo::from_value(&schema);
+        let info = SchemaInfo::from_schema(&schema);
         let label_config = labelstudio::generate_label_config(&info);
         let project_id =
             labelstudio::create_or_get_project(url, api_key, project_name, &label_config)?;
@@ -753,13 +758,13 @@ fn run_extract_streaming<F>(
     engine: &Engine,
     processor: &SchemaTransformer,
     texts: &[String],
-    schema: &Value,
+    schema: &ExtractionSchema,
     meta: &gliner2::schema::ExtractionMetadata,
     opts: &ExtractOptions,
     on_batch: F,
 ) -> Result<()>
 where
-    F: FnMut(usize, Vec<Value>) -> Result<()>,
+    F: FnMut(usize, Vec<ExtractionOutput>) -> Result<()>,
 {
     match engine {
         #[cfg(feature = "candle")]
@@ -791,13 +796,13 @@ fn run_extract_dispatch<F>(
     engines: &[Engine],
     processor: &SchemaTransformer,
     texts: &[String],
-    schema: &Value,
+    schema: &ExtractionSchema,
     meta: &gliner2::schema::ExtractionMetadata,
     opts: &ExtractOptions,
     on_batch: F,
 ) -> Result<()>
 where
-    F: FnMut(usize, Vec<Value>) -> Result<()>,
+    F: FnMut(usize, Vec<ExtractionOutput>) -> Result<()>,
 {
     if engines.len() <= 1 {
         run_extract_streaming(&engines[0], processor, texts, schema, meta, opts, on_batch)
@@ -810,13 +815,13 @@ fn run_extract_streaming_multi<F>(
     engines: &[Engine],
     processor: &SchemaTransformer,
     texts: &[String],
-    schema: &Value,
+    schema: &ExtractionSchema,
     meta: &gliner2::schema::ExtractionMetadata,
     opts: &ExtractOptions,
     mut on_batch: F,
 ) -> Result<()>
 where
-    F: FnMut(usize, Vec<Value>) -> Result<()>,
+    F: FnMut(usize, Vec<ExtractionOutput>) -> Result<()>,
 {
     use rayon::prelude::*;
 
@@ -828,7 +833,7 @@ where
     let bs = opts.batch_size.max(1);
 
     // Collect all results with their original indices
-    let mut all_results: Vec<(usize, Value)> = Vec::with_capacity(texts.len());
+    let mut all_results: Vec<(usize, ExtractionOutput)> = Vec::with_capacity(texts.len());
 
     // Process in chunks of batch_size * num_workers for better parallelism
     let chunk_size = bs * num_workers;
@@ -836,7 +841,7 @@ where
 
     for chunk in texts.chunks(chunk_size) {
         // Split chunk among workers — each gets up to `bs` texts
-        let worker_results: Vec<Result<Vec<(usize, Value)>>> = (0..num_workers)
+        let worker_results: Vec<Result<Vec<(usize, ExtractionOutput)>>> = (0..num_workers)
             .into_par_iter()
             .map(|worker_idx| {
                 let start = worker_idx * bs;
@@ -899,7 +904,8 @@ where
 
         // Emit the sorted chunk as a single batch — base is the global offset into texts
         if !all_results.is_empty() {
-            let batch: Vec<Value> = all_results.iter().map(|(_, val)| val.clone()).collect();
+            let batch: Vec<ExtractionOutput> =
+                all_results.iter().map(|(_, val)| val.clone()).collect();
             on_batch(base, batch)?;
             base += all_results.len();
         }
@@ -925,17 +931,20 @@ fn create_jsonl_writer(cli: &Cli) -> Result<Box<dyn io::Write>> {
 fn write_jsonl_batch(
     writer: &mut Box<dyn io::Write>,
     records: &[Record],
-    results: &[Value],
+    results: &[ExtractionOutput],
     pretty: bool,
     cli: &Cli,
 ) -> Result<()> {
     for (i, r) in results.iter().enumerate() {
         let mut out_obj = serde_json::Map::new();
         if let Some(id) = &records[i].id {
-            out_obj.insert(cli.id_field.clone(), id.clone());
+            out_obj.insert(cli.id_field.clone(), Value::String(id.clone()));
         }
         out_obj.insert(cli.text_field.clone(), json!(records[i].text));
-        out_obj.insert("result".into(), r.clone());
+        out_obj.insert(
+            "result".into(),
+            serde_json::to_value(r).context("serialize extraction result")?,
+        );
         if pretty {
             serde_json::to_writer_pretty(&mut *writer, &out_obj)?;
         } else {
@@ -974,7 +983,7 @@ fn create_parquet_writer(path: &Path, cli: &Cli) -> Result<parquet::arrow::Arrow
 fn write_parquet_batch(
     writer: &mut parquet::arrow::ArrowWriter<fs::File>,
     records: &[Record],
-    results: &[Value],
+    results: &[ExtractionOutput],
     cli: &Cli,
 ) -> Result<()> {
     use arrow_array::{RecordBatch, StringArray};
@@ -987,15 +996,7 @@ fn write_parquet_batch(
         Field::new("result", DataType::Utf8, false),
     ]));
 
-    let ids: StringArray = records
-        .iter()
-        .map(|r| {
-            r.id.as_ref().map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-        })
-        .collect();
+    let ids: StringArray = records.iter().map(|r| r.id.as_deref()).collect();
 
     let texts: StringArray = records.iter().map(|r| Some(r.text.as_str())).collect();
 
@@ -1030,6 +1031,15 @@ fn read_jsonl(reader: impl BufRead, cli: &Cli) -> Result<Vec<Record>> {
     Ok(records)
 }
 
+fn json_scalar_to_id_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
     let obj = v.as_object().context("Expected JSON object for record")?;
     let text = obj
@@ -1037,7 +1047,10 @@ fn val_to_record(v: &Value, cli: &Cli) -> Result<Record> {
         .and_then(|t| t.as_str())
         .context(format!("Missing text field {:?} in record", cli.text_field))?
         .to_string();
-    let id = obj.get(&cli.id_field).cloned();
+    let id = obj
+        .get(&cli.id_field)
+        .filter(|v| !v.is_null())
+        .map(json_scalar_to_id_string);
     Ok(Record { id, text })
 }
 
@@ -1073,14 +1086,14 @@ fn read_parquet_records(path: &Path, cli: &Cli) -> Result<Vec<Record>> {
             let id = id_col.and_then(|col| {
                 let any = col.as_any();
                 any.downcast_ref::<arrow_array::StringArray>()
-                    .map(|s| json!(s.value(row)))
+                    .map(|s| s.value(row).to_string())
                     .or_else(|| {
                         any.downcast_ref::<arrow_array::Int64Array>()
-                            .map(|i| json!(i.value(row)))
+                            .map(|i| i.value(row).to_string())
                     })
                     .or_else(|| {
                         any.downcast_ref::<arrow_array::Int32Array>()
-                            .map(|i| json!(i.value(row)))
+                            .map(|i| i.value(row).to_string())
                     })
             });
             records.push(Record { id, text });
@@ -1093,7 +1106,9 @@ fn read_parquet_records(path: &Path, cli: &Cli) -> Result<Vec<Record>> {
 // Schema building
 // ---------------------------------------------------------------------------
 
-fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::ExtractionMetadata)> {
+fn build_schema_and_meta(
+    cmd: &Commands,
+) -> Result<(ExtractionSchema, gliner2::schema::ExtractionMetadata)> {
     let mut s = gliner2::schema::create_schema();
     match cmd {
         Commands::Entities {
@@ -1103,10 +1118,10 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
                 anyhow::bail!("Cannot provide both --label and --labels-json");
             }
             if let Some(path) = labels_json {
-                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+                let v: EntityTypesInput = serde_json::from_str(&fs::read_to_string(path)?)?;
                 s.entities(v);
             } else {
-                s.entities(json!(label));
+                s.entities(EntityTypesInput::Many(label.clone()));
             }
         }
         Commands::Classify {
@@ -1123,7 +1138,7 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
             let labels = if let Some(path) = labels_json {
                 serde_json::from_str(&fs::read_to_string(path)?)?
             } else {
-                json!(label)
+                ClassificationLabelsInput::List(label.clone())
             };
             s.classification(task, labels, *multi_label, *cls_threshold);
         }
@@ -1138,7 +1153,7 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
             let rels = if let Some(path) = relations_json {
                 serde_json::from_str(&fs::read_to_string(path)?)?
             } else {
-                json!(relation)
+                RelationTypesInput::Many(relation.clone())
             };
             s.relations(rels);
         }
@@ -1151,21 +1166,20 @@ fn build_schema_and_meta(cmd: &Commands) -> Result<(Value, gliner2::schema::Extr
                 anyhow::bail!("Cannot provide both --structures and --structures-json");
             }
             if let Some(path) = structures {
-                let v: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-                let obj = v
-                    .as_object()
-                    .context("--structures must be a JSON object")?;
-                s.extract_json_structures(obj)?;
+                let m: IndexMap<String, Vec<FieldSpecSource>> = serde_json::from_str(
+                    &fs::read_to_string(path)?,
+                )
+                .context("--structures must be a JSON object mapping parents to spec arrays")?;
+                s.extract_json_structures(&m)?;
             } else if let Some(js) = structures_json {
-                let v: Value = serde_json::from_str(js)?;
-                let obj = v
-                    .as_object()
-                    .context("--structures-json must be a JSON object")?;
-                s.extract_json_structures(obj)?;
+                let m: IndexMap<String, Vec<FieldSpecSource>> = serde_json::from_str(js).context(
+                    "--structures-json must be a JSON object mapping parents to spec arrays",
+                )?;
+                s.extract_json_structures(&m)?;
             }
         }
         Commands::Run { schema_file, .. } => {
-            let v: Value = serde_json::from_str(&fs::read_to_string(schema_file)?)?;
+            let v: ExtractionSchema = serde_json::from_str(&fs::read_to_string(schema_file)?)?;
             let meta = infer_metadata_from_schema(&v);
             return Ok((v, meta));
         }

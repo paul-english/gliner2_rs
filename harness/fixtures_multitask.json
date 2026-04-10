@@ -15,8 +15,46 @@
           "task": "sentiment",
           "labels": ["positive", "negative", "neutral"],
           "multi_label": false,
-          "cls_threshold": 0.5,
-          "true_label": ["N/A"]
+          "cls_threshold": 0.5
+        }
+      ]
+    }
+  },
+  {
+    "id": "comprehensive_multitask",
+    "text": "Apple CEO Tim Cook unveiled the revolutionary iPhone 15 Pro for $999. The device features an A17 Pro chip and titanium design. Tim Cook works for Apple, which is located in Cupertino.",
+    "threshold": 0.5,
+    "schema": {
+      "json_structures": [
+        {
+          "parents": {
+            "product_info": {
+              "name": "name::str::::Product name",
+              "price": "price::str::::Product price",
+              "features": "features::list::::Key features",
+              "availability": "availability::str::[in_stock, pre_order, sold_out]::Stock status"
+            }
+          }
+        }
+      ],
+      "entities": {
+        "person": "Names of people, executives, or individuals",
+        "company": "Organization, corporation, or business names",
+        "product": "Products, services, or offerings mentioned"
+      },
+      "relations": ["works_for", "founded", "located_in"],
+      "classifications": [
+        {
+          "task": "sentiment",
+          "labels": ["positive", "negative", "neutral"],
+          "multi_label": false,
+          "cls_threshold": 0.5
+        },
+        {
+          "task": "category",
+          "labels": ["technology", "business", "finance", "healthcare"],
+          "multi_label": false,
+          "cls_threshold": 0.5
         }
       ]
     }

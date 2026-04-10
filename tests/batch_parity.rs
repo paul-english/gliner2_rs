@@ -1,11 +1,11 @@
 //! Batch vs sequential extraction parity (downloads model on first run).
 use gliner2::config::download_model;
-use gliner2::schema::infer_metadata_from_schema;
+use gliner2::schema::{ExtractionSchema, infer_metadata_from_schema};
 use gliner2::{
     BatchSchemaMode, CandleExtractor, ExtractOptions, ExtractorConfig, SchemaTransformer,
     batch_extract, extract_with_schema,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[test]
 #[ignore = "downloads ~GB model from Hugging Face; run: cargo test -p gliner2 --test batch_parity -- --ignored"]
@@ -22,9 +22,10 @@ fn batch_extract_matches_sequential_shared_schema() {
 
     let extractor = CandleExtractor::load_cpu(&files, config, vocab).unwrap();
 
-    let schema = json!({
+    let schema: ExtractionSchema = serde_json::from_value(json!({
         "entities": { "person": "", "company": "" }
-    });
+    }))
+    .unwrap();
     let meta = infer_metadata_from_schema(&schema);
 
     let texts: Vec<String> = vec![
@@ -76,11 +77,13 @@ fn batch_extract_matches_sequential_per_sample_schema() {
 
     let extractor = CandleExtractor::load_cpu(&files, config, vocab).unwrap();
 
-    let s0 = json!({ "entities": { "person": "", "company": "" } });
-    let s1 = json!({ "entities": { "location": "" } });
+    let s0: ExtractionSchema =
+        serde_json::from_value(json!({ "entities": { "person": "", "company": "" } })).unwrap();
+    let s1: ExtractionSchema =
+        serde_json::from_value(json!({ "entities": { "location": "" } })).unwrap();
     let meta0 = infer_metadata_from_schema(&s0);
     let meta1 = infer_metadata_from_schema(&s1);
-    let schemas: Vec<Value> = vec![s0.clone(), s1.clone()];
+    let schemas = vec![s0, s1];
     let metas = vec![meta0, meta1];
 
     let texts: Vec<String> = vec!["Alice works at Acme.".into(), "They met in Berlin.".into()];

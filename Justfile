@@ -1,20 +1,23 @@
 # Default libtorch path from `gliner2 setup`
 libtorch := clean(config_directory() / "gliner2/lib/libtorch")
 
+export LIBTORCH := clean(config_directory() / "gliner2/lib/libtorch")
+export GLINER2_BENCH_TCH := "1"
+
 clean:
     cargo clean
 
 build: clean
-    LIBTORCH={{libtorch}} cargo build --all-targets
+    cargo build --all-targets
 
 build-release: clean
-    LIBTORCH={{libtorch}} cargo build --all-targets --release
+    cargo build --all-targets --release
 
 run *ARGS:
-    LIBTORCH={{libtorch}} cargo run -F tch -- {{ARGS}}
+    cargo run -F tch -- {{ARGS}}
 
 clippy:
-    LIBTORCH={{libtorch}} cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 fmt:
     cargo fmt
@@ -24,11 +27,9 @@ setup:
 
 # Test all
 test *ARGS:
-    LIBTORCH={{libtorch}} cargo test --all-features {{ARGS}}
+    cargo test {{ARGS}}
 
-bench:
-    export GLINER2_BENCH_TCH=1
-    export LIBTORCH={{libtorch}}
+bench: build-release
     harness/run_all.sh
     harness/run_compare_all.sh
     harness/run_multitask.sh

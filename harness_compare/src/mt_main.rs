@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use gliner2::TchExtractor;
 use gliner2::config::download_model;
 use gliner2::extract::{ExtractOptions, extract_with_schema};
+use gliner2::schema::ExtractionSchema;
 use gliner2::{CandleExtractor, ExtractorConfig, SchemaTransformer, infer_metadata_from_schema};
 use serde::Serialize;
 use serde_json::Value;
@@ -18,7 +19,7 @@ const DEFAULT_MODEL_ID: &str = "fastino/gliner2-base-v1";
 struct MtFixture {
     id: String,
     text: String,
-    schema: Value,
+    schema: ExtractionSchema,
     #[serde(default = "default_threshold")]
     threshold: f32,
 }
@@ -178,7 +179,7 @@ fn main() -> Result<()> {
                     text: f.text,
                     threshold: f.threshold,
                     infer_ms,
-                    result,
+                    result: serde_json::to_value(&result)?,
                 });
             }
 
@@ -224,7 +225,7 @@ fn main() -> Result<()> {
                     text: f.text,
                     threshold: f.threshold,
                     infer_ms,
-                    result,
+                    result: serde_json::to_value(&result)?,
                 });
             }
 
