@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use gliner2::CandleExtractor;
 use gliner2::config::{ModelFiles, download_model};
 use gliner2::{
-    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer,
-    batch_extract_streaming, infer_metadata_from_schema,
+    BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract_streaming,
+    infer_metadata_from_schema,
 };
 #[cfg(feature = "tch")]
 use gliner2::{TchExtractor, parse_tch_device};
@@ -78,6 +78,12 @@ struct Cli {
 
     #[arg(long, default_value_t = 8, global = true)]
     batch_size: usize,
+
+    /// Number of parallel engine instances (1 = sequential, >1 = parallel).
+    /// With tch + cuda, workers are assigned to cuda:0, cuda:1, … automatically.
+    /// Each worker loads a full copy of the model weights.
+    #[arg(long, default_value_t = 1, global = true)]
+    num_workers: usize,
 
     /// Field containing document text in JSON / JSONL records
     #[arg(long, default_value = "text", global = true)]
@@ -469,26 +475,17 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
     let processor = SchemaTransformer::new(files.tokenizer.to_str().unwrap())?;
     let vocab = processor.tokenizer.get_vocab_size(true);
 
-    let engine = if backend == "tch" {
-        #[cfg(feature = "tch")]
-        {
-            let dev = parse_tch_device(&cli.device)?;
-            Engine::Tch(TchExtractor::load(&files, config, vocab, dev)?)
-        }
-        #[cfg(not(feature = "tch"))]
-        {
-            anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
-        }
-    } else {
-        #[cfg(feature = "candle")]
-        {
-            Engine::Candle(CandleExtractor::load_cpu(&files, config, vocab)?)
-        }
-        #[cfg(not(feature = "candle"))]
-        {
-            anyhow::bail!("Backend \"candle\" requires the default `candle` feature");
-        }
-    };
+    let num_workers = cli.num_workers.max(1);
+    if num_workers > 1 {
+        tracing::info!(
+            num_workers,
+            batch_size = cli.batch_size,
+            device = %cli.device,
+            backend,
+            "multi-worker parallel extraction enabled"
+        );
+    }
+    let engines = create_engines(&cli, backend, &files, &config, vocab, num_workers)?;
 
     let input_path = match &cli.command {
         Commands::Entities { input, .. } => input,
@@ -517,27 +514,72 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
     if let Input::ParquetGlob(ref paths) = input {
         if let Output::Parquet(ref out_dir) = output_format {
             fs::create_dir_all(out_dir)?;
-            for in_path in paths {
-                let records = read_parquet_records(in_path, &cli)?;
-                if records.is_empty() {
-                    continue;
+            if num_workers > 1 {
+                // Process parquet files in parallel — one engine per file (round-robin).
+                // Each file uses a single engine to avoid nested rayon parallelism
+                // that would cause thread contention.
+                use rayon::prelude::*;
+                paths
+                    .par_iter()
+                    .enumerate()
+                    .map(|(file_idx, in_path)| -> Result<()> {
+                        let records = read_parquet_records(in_path, &cli)?;
+                        if records.is_empty() {
+                            return Ok(());
+                        }
+                        let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+                        let out_path = out_dir
+                            .join(in_path.file_name().context("input file has no filename")?);
+                        let mut writer = create_parquet_writer(&out_path, &cli)?;
+                        let engine = &engines[file_idx % engines.len()];
+                        run_extract_streaming(
+                            engine,
+                            &processor,
+                            &texts,
+                            &schema,
+                            &meta,
+                            &opts,
+                            |offset, batch| {
+                                write_parquet_batch(
+                                    &mut writer,
+                                    &records[offset..offset + batch.len()],
+                                    &batch,
+                                    &cli,
+                                )
+                            },
+                        )?;
+                        writer.close()?;
+                        Ok(())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            } else {
+                for in_path in paths {
+                    let records = read_parquet_records(in_path, &cli)?;
+                    if records.is_empty() {
+                        continue;
+                    }
+                    let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
+                    let out_path =
+                        out_dir.join(in_path.file_name().context("input file has no filename")?);
+                    let mut writer = create_parquet_writer(&out_path, &cli)?;
+                    run_extract_dispatch(
+                        &engines,
+                        &processor,
+                        &texts,
+                        &schema,
+                        &meta,
+                        &opts,
+                        |offset, batch| {
+                            write_parquet_batch(
+                                &mut writer,
+                                &records[offset..offset + batch.len()],
+                                &batch,
+                                &cli,
+                            )
+                        },
+                    )?;
+                    writer.close()?;
                 }
-                let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
-                let out_path =
-                    out_dir.join(in_path.file_name().context("input file has no filename")?);
-                let mut writer = create_parquet_writer(&out_path, &cli)?;
-                run_extract_streaming(
-                    &engine,
-                    &processor,
-                    &texts,
-                    &schema,
-                    &meta,
-                    &opts,
-                    |offset, batch| {
-                        write_parquet_batch(&mut writer, &records[offset..offset + batch.len()], &batch, &cli)
-                    },
-                )?;
-                writer.close()?;
             }
             return Ok(());
         }
@@ -554,15 +596,20 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
     match output_format {
         Output::Parquet(ref path) => {
             let mut writer = create_parquet_writer(path, &cli)?;
-            run_extract_streaming(
-                &engine,
+            run_extract_dispatch(
+                &engines,
                 &processor,
                 &texts,
                 &schema,
                 &meta,
                 &opts,
                 |offset, batch| {
-                    write_parquet_batch(&mut writer, &records[offset..offset + batch.len()], &batch, &cli)
+                    write_parquet_batch(
+                        &mut writer,
+                        &records[offset..offset + batch.len()],
+                        &batch,
+                        &cli,
+                    )
                 },
             )?;
             writer.close()?;
@@ -570,21 +617,76 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
         Output::Jsonl => {
             let mut out_writer = create_jsonl_writer(&cli)?;
             let use_pretty = cli.pretty && texts.len() == 1;
-            run_extract_streaming(
-                &engine,
+            run_extract_dispatch(
+                &engines,
                 &processor,
                 &texts,
                 &schema,
                 &meta,
                 &opts,
                 |offset, batch| {
-                    write_jsonl_batch(&mut out_writer, &records[offset..offset + batch.len()], &batch, use_pretty, &cli)
+                    write_jsonl_batch(
+                        &mut out_writer,
+                        &records[offset..offset + batch.len()],
+                        &batch,
+                        use_pretty,
+                        &cli,
+                    )
                 },
             )?;
         }
     }
 
     Ok(())
+}
+
+fn create_engines(
+    cli: &Cli,
+    backend: &str,
+    files: &ModelFiles,
+    config: &ExtractorConfig,
+    vocab: usize,
+    num_workers: usize,
+) -> Result<Vec<Engine>> {
+    let mut engines = Vec::with_capacity(num_workers);
+    for worker_idx in 0..num_workers {
+        let engine = if backend == "tch" {
+            #[cfg(feature = "tch")]
+            {
+                // For "cuda" without index, assign cuda:0, cuda:1, etc. per worker.
+                // For "cuda:N" with index, assign cuda:N, cuda:N+1, etc.
+                // For other devices (cpu, mps, vulkan), all workers share the same device.
+                let device_str = if cli.device == "cuda" {
+                    format!("cuda:{}", worker_idx)
+                } else if cli.device.contains(':') {
+                    let (base, idx) = cli.device.rsplit_once(':').unwrap();
+                    let device_idx: usize = idx.parse().context("parse device index")?;
+                    format!("{}:{}", base, device_idx + worker_idx)
+                } else {
+                    cli.device.clone()
+                };
+                let dev = parse_tch_device(&device_str)?;
+                Engine::Tch(TchExtractor::load(files, config.clone(), vocab, dev)?)
+            }
+            #[cfg(not(feature = "tch"))]
+            {
+                let _ = worker_idx;
+                anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
+            }
+        } else {
+            #[cfg(feature = "candle")]
+            {
+                let _ = cli;
+                Engine::Candle(CandleExtractor::load_cpu(files, config.clone(), vocab)?)
+            }
+            #[cfg(not(feature = "candle"))]
+            {
+                anyhow::bail!("Backend \"candle\" requires the default `candle` feature");
+            }
+        };
+        engines.push(engine);
+    }
+    Ok(engines)
 }
 
 fn run_extract_streaming<F>(
@@ -621,6 +723,131 @@ where
         #[cfg(not(any(feature = "candle", feature = "tch")))]
         _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
     }
+}
+
+/// Dispatch to single-engine streaming when only one engine is available,
+/// or to multi-engine parallel extraction otherwise.
+fn run_extract_dispatch<F>(
+    engines: &[Engine],
+    processor: &SchemaTransformer,
+    texts: &[String],
+    schema: &Value,
+    meta: &gliner2::schema::ExtractionMetadata,
+    opts: &ExtractOptions,
+    on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(usize, Vec<Value>) -> Result<()>,
+{
+    if engines.len() <= 1 {
+        run_extract_streaming(&engines[0], processor, texts, schema, meta, opts, on_batch)
+    } else {
+        run_extract_streaming_multi(engines, processor, texts, schema, meta, opts, on_batch)
+    }
+}
+
+fn run_extract_streaming_multi<F>(
+    engines: &[Engine],
+    processor: &SchemaTransformer,
+    texts: &[String],
+    schema: &Value,
+    meta: &gliner2::schema::ExtractionMetadata,
+    opts: &ExtractOptions,
+    mut on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(usize, Vec<Value>) -> Result<()>,
+{
+    use rayon::prelude::*;
+
+    if texts.is_empty() {
+        return Ok(());
+    }
+
+    let num_workers = engines.len().max(1);
+    let bs = opts.batch_size.max(1);
+
+    // Collect all results with their original indices
+    let mut all_results: Vec<(usize, Value)> = Vec::with_capacity(texts.len());
+
+    // Process in chunks of batch_size * num_workers for better parallelism
+    let chunk_size = bs * num_workers;
+    let mut base = 0usize;
+
+    for chunk in texts.chunks(chunk_size) {
+        // Split chunk among workers — each gets up to `bs` texts
+        let worker_results: Vec<Result<Vec<(usize, Value)>>> = (0..num_workers)
+            .into_par_iter()
+            .map(|worker_idx| {
+                let start = worker_idx * bs;
+                let end = (start + bs).min(chunk.len());
+                if start >= chunk.len() {
+                    return Ok(Vec::new());
+                }
+
+                let worker_texts = &chunk[start..end];
+                let engine = &engines[worker_idx];
+                let mut local_results = Vec::with_capacity(worker_texts.len());
+
+                match engine {
+                    #[cfg(feature = "candle")]
+                    Engine::Candle(e) => {
+                        batch_extract_streaming(
+                            e,
+                            processor,
+                            worker_texts,
+                            BatchSchemaMode::Shared { schema, meta },
+                            opts,
+                            |offset, batch| {
+                                for (i, val) in batch.into_iter().enumerate() {
+                                    local_results.push((start + offset + i, val));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    #[cfg(feature = "tch")]
+                    Engine::Tch(e) => {
+                        batch_extract_streaming(
+                            e,
+                            processor,
+                            worker_texts,
+                            BatchSchemaMode::Shared { schema, meta },
+                            opts,
+                            |offset, batch| {
+                                for (i, val) in batch.into_iter().enumerate() {
+                                    local_results.push((start + offset + i, val));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    #[cfg(not(any(feature = "candle", feature = "tch")))]
+                    _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
+                }
+
+                Ok(local_results)
+            })
+            .collect();
+
+        // Merge results and sort by chunk-relative index to preserve input order
+        for result in worker_results {
+            let mut r = result?;
+            all_results.append(&mut r);
+        }
+        all_results.sort_by_key(|(idx, _)| *idx);
+
+        // Emit the sorted chunk as a single batch — base is the global offset into texts
+        if !all_results.is_empty() {
+            let batch: Vec<Value> = all_results.iter().map(|(_, val)| val.clone()).collect();
+            on_batch(base, batch)?;
+            base += all_results.len();
+        }
+
+        all_results.clear();
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +887,7 @@ fn write_jsonl_batch(
     Ok(())
 }
 
-fn create_parquet_writer(
-    path: &Path,
-    cli: &Cli,
-) -> Result<parquet::arrow::ArrowWriter<fs::File>> {
+fn create_parquet_writer(path: &Path, cli: &Cli) -> Result<parquet::arrow::ArrowWriter<fs::File>> {
     use arrow_schema::{DataType, Field, Schema};
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;

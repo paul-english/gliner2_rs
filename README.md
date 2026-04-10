@@ -570,7 +570,7 @@ These apply to every subcommand unless stated otherwise.
 
 Use either Hub resolution (`--model`) **or** a local layout (`--model-dir` or explicit file flags), not a conflicting mix; if both are given, the implementation should reject the invocation with a clear error.
 
-**Device and dtype** are intentionally unspecified here until the library exposes them; do not document GPU flags until they exist.
+**Device and dtype** flags are documented under [Parallelism](#parallelism) below.
 
 ### Shared inference flags
 
@@ -594,10 +594,25 @@ The **library** implements tensor batch inference (`CandleExtractor::batch_extra
 | `--batch-size <N>` | Maximum records per model batch. Default: **8** (implementation may choose a lower value on constrained devices, but must document any deviation). |
 | `--batch-size 1`   | Effectively sequential inference (debugging, peak memory limits, or until batched paths are stable).                                               |
 
-
 **Single-record** inputs (one JSONL line, one JSON object, or `--text-split full` over an entire file) form a single batch of size 1.
 
 **Ordering:** Output lines must follow **the same order as input records**, even when flushing internal batches.
+
+### Parallelism
+
+The CLI supports parallel inference across multiple CPU cores or GPU devices. This is most effective with GPU backends where each device has independent compute and memory; on CPU, increasing `--batch-size` often yields better throughput than adding workers.
+
+| Flag                | Description                                                                                                                                                                                                                           |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--num-workers <N>` | Number of parallel engine instances. Default: **1** (sequential). When >1, the CLI creates N engine instances and distributes batches across them.                                                                                    |
+| `--backend <NAME>`  | Inference backend: `candle` (default, CPU-only) or `tch` (LibTorch, supports GPU). Also set via `GLINER2_BACKEND` env var.                                                                                                            |
+| `--device <SPEC>`   | Device for the `tch` backend (ignored for candle): `cpu`, `cuda`, `cuda:N`, `mps`, `vulkan`, `auto`. Also set via `GLINER2_DEVICE` env var. Default: `cpu`.                                                                             |
+
+**Multi-GPU usage:** With `--backend tch --device cuda --num-workers 4`, the CLI creates four engines on `cuda:0`, `cuda:1`, `cuda:2`, and `cuda:3` respectively. If `--device cuda:2` is given instead, workers are placed on `cuda:2`, `cuda:3`, `cuda:4`, `cuda:5`.
+
+**Multi-file parquet:** When the input is a glob of parquet files (`*.parquet`) and `--num-workers > 1`, files are processed in parallel (one engine per file, round-robin). This avoids nested parallelism and maximises throughput for large datasets.
+
+**Memory note:** Each worker loads a full copy of the model weights. On CPU this means `num_workers × model_size` RAM; on GPU each device must hold its own copy in VRAM.
 
 ### Input and output
 
