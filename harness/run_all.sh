@@ -9,15 +9,20 @@ RUST_TCH_OUT="${RUST_TCH_OUT:-${RUST_OUT%.json}_tch.json}"
 
 # Pin target dir to the repo so the binary path is stable (some environments override CARGO_TARGET_DIR).
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-# shellcheck source=harness/prepend_libtorch_ld_path.sh
-. "$ROOT/harness/prepend_libtorch_ld_path.sh"
+refresh_libtorch_ld_path() {
+  # shellcheck source=harness/prepend_libtorch_ld_path.sh
+  . "$ROOT/harness/prepend_libtorch_ld_path.sh"
+}
+
+refresh_libtorch_ld_path
 
 # Build workspace member quietly; stdout only is JSON (stderr may show compile progress).
 (cd "$ROOT" && cargo build -q --release -p harness_compare && "$CARGO_TARGET_DIR/release/harness_compare" "$FIXTURES") >"$RUST_OUT"
 COMPARE_EXTRA=()
 if [[ "${GLINER2_BENCH_TCH:-}" == "1" ]]; then
-  (cd "$ROOT" && cargo build -q --release -p harness_compare --features tch-backend,download-libtorch \
-    && "$CARGO_TARGET_DIR/release/harness_compare" "$FIXTURES" --backend tch) >"$RUST_TCH_OUT"
+  (cd "$ROOT" && cargo build -q --release -p harness_compare --features tch-backend,download-libtorch)
+  refresh_libtorch_ld_path
+  (cd "$ROOT" && "$CARGO_TARGET_DIR/release/harness_compare" "$FIXTURES" --backend tch) >"$RUST_TCH_OUT"
   COMPARE_EXTRA=(--rust-tch "$RUST_TCH_OUT")
 fi
 # CPU-vs-CPU: hide discrete GPUs from PyTorch and load weights onto CPU.

@@ -17,8 +17,12 @@ SAMPLES="${5:-64}"
 PY_OUT="${6:-${TMPDIR:-/tmp}/gliner2_python_throughput.json}"
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-# shellcheck source=harness/prepend_libtorch_ld_path.sh
-. "$ROOT/harness/prepend_libtorch_ld_path.sh"
+refresh_libtorch_ld_path() {
+  # shellcheck source=harness/prepend_libtorch_ld_path.sh
+  . "$ROOT/harness/prepend_libtorch_ld_path.sh"
+}
+
+refresh_libtorch_ld_path
 
 BIN="$CARGO_TARGET_DIR/release/harness_throughput"
 
@@ -41,6 +45,7 @@ run_rust_triple() {
 
 if [[ "${GLINER2_BENCH_TCH:-}" == "1" ]]; then
   (cd "$ROOT" && cargo build -q --release -p harness_compare --features tch-backend,download-libtorch --bin harness_throughput)
+  refresh_libtorch_ld_path
   run_rust_triple candle "$RUST_SEQ_OUT" "$RUST_BATCH_8_OUT" "$RUST_BATCH_64_OUT"
   RUST_SEQ_TCH="$(rust_tch_path "$RUST_SEQ_OUT")"
   RUST_BATCH_8_TCH="$(rust_tch_path "$RUST_BATCH_8_OUT")"
@@ -64,7 +69,11 @@ if [[ "$BACKEND" == "tch" ]]; then
 fi
 
 (cd "$ROOT" && cargo build -q --release -p harness_compare "${CARGO_FEATS[@]}" --bin harness_throughput \
-  && run_rust_triple "$BACKEND" "$RUST_SEQ_OUT" "$RUST_BATCH_8_OUT" "$RUST_BATCH_64_OUT")
+)
+if [[ "$BACKEND" == "tch" ]]; then
+  refresh_libtorch_ld_path
+fi
+run_rust_triple "$BACKEND" "$RUST_SEQ_OUT" "$RUST_BATCH_8_OUT" "$RUST_BATCH_64_OUT"
 
 (cd "$ROOT/harness" && env CUDA_VISIBLE_DEVICES= uv run python benchmark_throughput.py \
   --fixtures "$FIXTURES" --device cpu --mode both --samples "$SAMPLES" \
