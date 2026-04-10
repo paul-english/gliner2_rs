@@ -1,8 +1,11 @@
+mod labelstudio;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 #[cfg(feature = "candle")]
 use gliner2::CandleExtractor;
 use gliner2::config::{ModelFiles, download_model};
+use gliner2::SchemaInfo;
 use gliner2::{
     BatchSchemaMode, ExtractOptions, ExtractorConfig, SchemaTransformer, batch_extract_streaming,
     infer_metadata_from_schema,
@@ -104,6 +107,11 @@ struct Cli {
     /// Pretty-print JSON (only if output can be buffered)
     #[arg(long, global = true)]
     pretty: bool,
+
+    /// Send results to a Label Studio project as pre-annotations.
+    /// Requires LABEL_STUDIO_URL and LABEL_STUDIO_API_KEY env vars.
+    #[arg(long, global = true)]
+    labelstudio: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -468,6 +476,17 @@ fn resolve_model_files(cli: &Cli) -> Result<ModelFiles> {
 }
 
 fn run(cli: Cli, backend: &str) -> Result<()> {
+    // Validate Label Studio config early (before model load)
+    let ls_config = if let Some(ref project_name) = cli.labelstudio {
+        let url = std::env::var("LABEL_STUDIO_URL")
+            .context("--labelstudio requires LABEL_STUDIO_URL env var")?;
+        let api_key = std::env::var("LABEL_STUDIO_API_KEY")
+            .context("--labelstudio requires LABEL_STUDIO_API_KEY env var")?;
+        Some((project_name.clone(), url, api_key))
+    } else {
+        None
+    };
+
     let files = resolve_model_files(&cli)?;
 
     let config: ExtractorConfig = serde_json::from_str(&fs::read_to_string(&files.config)?)?;
@@ -501,13 +520,26 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
 
     let (schema, meta) = build_schema_and_meta(&cli.command)?;
 
+    // When Label Studio output is active, force include_spans and include_confidence
+    // so that char offsets are available for NER/relation pre-annotations.
     let opts = ExtractOptions {
         threshold: cli.threshold,
         format_results: !cli.raw && cli.format_results,
-        include_confidence: cli.include_confidence,
-        include_spans: cli.include_spans,
+        include_confidence: cli.include_confidence || ls_config.is_some(),
+        include_spans: cli.include_spans || ls_config.is_some(),
         max_len: cli.max_len,
         batch_size: cli.batch_size,
+    };
+
+    // Set up Label Studio project if requested
+    let ls_state = if let Some((ref project_name, ref url, ref api_key)) = ls_config {
+        let info = SchemaInfo::from_value(&schema);
+        let label_config = labelstudio::generate_label_config(&info);
+        let project_id =
+            labelstudio::create_or_get_project(url, api_key, project_name, &label_config)?;
+        Some((url.clone(), api_key.clone(), project_id, info))
+    } else {
+        None
     };
 
     // Multi-file parquet: process each file independently, streaming results
@@ -593,6 +625,9 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
 
     let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
 
+    // Accumulate Label Studio tasks alongside normal output when --labelstudio is active
+    let mut ls_tasks: Vec<Value> = Vec::new();
+
     match output_format {
         Output::Parquet(ref path) => {
             let mut writer = create_parquet_writer(path, &cli)?;
@@ -604,6 +639,15 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
                 &meta,
                 &opts,
                 |offset, batch| {
+                    if let Some((_, _, _, ref info)) = ls_state {
+                        for (i, result) in batch.iter().enumerate() {
+                            ls_tasks.push(labelstudio::convert_result_to_task(
+                                &records[offset + i].text,
+                                result,
+                                info,
+                            ));
+                        }
+                    }
                     write_parquet_batch(
                         &mut writer,
                         &records[offset..offset + batch.len()],
@@ -625,6 +669,15 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
                 &meta,
                 &opts,
                 |offset, batch| {
+                    if let Some((_, _, _, ref info)) = ls_state {
+                        for (i, result) in batch.iter().enumerate() {
+                            ls_tasks.push(labelstudio::convert_result_to_task(
+                                &records[offset + i].text,
+                                result,
+                                info,
+                            ));
+                        }
+                    }
                     write_jsonl_batch(
                         &mut out_writer,
                         &records[offset..offset + batch.len()],
@@ -634,6 +687,13 @@ fn run(cli: Cli, backend: &str) -> Result<()> {
                     )
                 },
             )?;
+        }
+    }
+
+    // Upload accumulated tasks to Label Studio
+    if let Some((ref url, ref api_key, project_id, _)) = ls_state {
+        if !ls_tasks.is_empty() {
+            labelstudio::import_tasks(url, api_key, project_id, &ls_tasks)?;
         }
     }
 

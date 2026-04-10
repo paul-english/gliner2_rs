@@ -582,10 +582,11 @@ impl<'a> StructureBuilder<'a> {
         let name = name.into();
         let st = self.schema.active_structure.as_mut().expect("structure");
         st.field_order.push(name.clone());
-        let v = if let Some(c) = choices.clone() {
-            json!({ "value": "", "choices": c })
-        } else {
-            json!("")
+        let v = match (&choices, dtype) {
+            (Some(c), ValueDtype::Str) => json!({ "value": "", "choices": c, "dtype": "str" }),
+            (Some(c), ValueDtype::List) => json!({ "value": "", "choices": c }),
+            (None, ValueDtype::Str) => json!({ "dtype": "str" }),
+            (None, ValueDtype::List) => json!(""),
         };
         st.fields.insert(name.clone(), v);
         if let Some(d) = description {
@@ -753,6 +754,174 @@ pub fn infer_metadata_from_schema(schema: &Value) -> ExtractionMetadata {
     }
 
     meta
+}
+
+// ---------------------------------------------------------------------------
+// Schema introspection
+// ---------------------------------------------------------------------------
+
+/// Description of a single entity type in a schema.
+#[derive(Clone, Debug)]
+pub struct EntityTypeInfo {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Description of a single relation type.
+#[derive(Clone, Debug)]
+pub struct RelationTypeInfo {
+    pub name: String,
+}
+
+/// Description of a classification task.
+#[derive(Clone, Debug)]
+pub struct ClassificationTaskInfo {
+    pub task: String,
+    pub labels: Vec<String>,
+    pub multi_label: bool,
+}
+
+/// Description of a field within a JSON structure.
+#[derive(Clone, Debug)]
+pub struct StructureFieldInfo {
+    pub name: String,
+    pub dtype: ValueDtype,
+    pub choices: Option<Vec<String>>,
+}
+
+/// Description of a JSON structure.
+#[derive(Clone, Debug)]
+pub struct StructureInfo {
+    pub name: String,
+    pub fields: Vec<StructureFieldInfo>,
+}
+
+/// All task types present in a schema, extracted for consumers that need to
+/// enumerate what a schema defines (e.g. generating Label Studio configs).
+#[derive(Clone, Debug, Default)]
+pub struct SchemaInfo {
+    pub entities: Vec<EntityTypeInfo>,
+    pub relations: Vec<RelationTypeInfo>,
+    pub classifications: Vec<ClassificationTaskInfo>,
+    pub structures: Vec<StructureInfo>,
+}
+
+impl SchemaInfo {
+    /// Extract structured task information from a built schema JSON value.
+    pub fn from_value(schema: &Value) -> Self {
+        let mut info = SchemaInfo::default();
+
+        // Entities
+        if let Some(ent_obj) = schema.get("entities").and_then(|v| v.as_object()) {
+            let desc_obj = schema
+                .get("entity_descriptions")
+                .and_then(|v| v.as_object());
+            for name in ent_obj.keys() {
+                let description = desc_obj
+                    .and_then(|d| d.get(name))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                info.entities.push(EntityTypeInfo {
+                    name: name.clone(),
+                    description,
+                });
+            }
+        }
+
+        // Relations
+        if let Some(arr) = schema.get("relations").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    for rel_name in obj.keys() {
+                        info.relations.push(RelationTypeInfo {
+                            name: rel_name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Classifications
+        if let Some(arr) = schema.get("classifications").and_then(|v| v.as_array()) {
+            for cls in arr {
+                let task = cls
+                    .get("task")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let labels = cls
+                    .get("labels")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let multi_label = cls
+                    .get("multi_label")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !task.is_empty() {
+                    info.classifications.push(ClassificationTaskInfo {
+                        task,
+                        labels,
+                        multi_label,
+                    });
+                }
+            }
+        }
+
+        // JSON structures
+        if let Some(arr) = schema.get("json_structures").and_then(|v| v.as_array()) {
+            for st in arr {
+                if let Some(obj) = st.as_object() {
+                    for (parent, fields_val) in obj {
+                        let mut fields = Vec::new();
+                        if let Some(fmap) = fields_val.as_object() {
+                            for (fname, fval) in fmap {
+                                let (dtype, choices) = match fval {
+                                    Value::String(_) => (ValueDtype::List, None),
+                                    Value::Object(o) => {
+                                        let dt = o
+                                            .get("dtype")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| match s {
+                                                "str" => ValueDtype::Str,
+                                                _ => ValueDtype::List,
+                                            })
+                                            .unwrap_or(ValueDtype::List);
+                                        let ch = o
+                                            .get("choices")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|v| v.as_str().map(String::from))
+                                                    .collect()
+                                            });
+                                        (dt, ch)
+                                    }
+                                    _ => (ValueDtype::List, None),
+                                };
+                                fields.push(StructureFieldInfo {
+                                    name: fname.clone(),
+                                    dtype,
+                                    choices,
+                                });
+                            }
+                        }
+                        info.structures.push(StructureInfo {
+                            name: parent.clone(),
+                            fields,
+                        });
+                    }
+                }
+            }
+        }
+
+        info
+    }
 }
 
 #[cfg(test)]
@@ -929,5 +1098,97 @@ mod tests {
         assert_eq!(p.name, "email");
         assert_eq!(p.validators.len(), 1);
         assert!(p.validators[0].validate("a@b"));
+    }
+
+    #[test]
+    fn introspect_entities_with_descriptions() {
+        let mut s = Schema::new();
+        s.entities(json!({"person": "A person's name", "org": "An organization"}));
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.entities.len(), 2);
+        let person = info.entities.iter().find(|e| e.name == "person").unwrap();
+        assert_eq!(person.description.as_deref(), Some("A person's name"));
+    }
+
+    #[test]
+    fn introspect_entities_simple() {
+        let mut s = Schema::new();
+        s.entities(json!(["person", "org"]));
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.entities.len(), 2);
+        assert!(info.entities[0].description.is_none());
+    }
+
+    #[test]
+    fn introspect_relations() {
+        let mut s = Schema::new();
+        s.relations(json!(["works_for", "located_in"]));
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.relations.len(), 2);
+        assert_eq!(info.relations[0].name, "works_for");
+        assert_eq!(info.relations[1].name, "located_in");
+    }
+
+    #[test]
+    fn introspect_classifications() {
+        let mut s = Schema::new();
+        s.classification("sentiment", json!(["positive", "negative"]), false, 0.5);
+        s.classification("topic", json!(["tech", "sports", "politics"]), true, 0.3);
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.classifications.len(), 2);
+        assert_eq!(info.classifications[0].task, "sentiment");
+        assert_eq!(info.classifications[0].labels, vec!["positive", "negative"]);
+        assert!(!info.classifications[0].multi_label);
+        assert_eq!(info.classifications[1].task, "topic");
+        assert!(info.classifications[1].multi_label);
+    }
+
+    #[test]
+    fn introspect_structures() {
+        let mut s = Schema::new();
+        let m = json!({
+            "product_info": [
+                "name::str",
+                "features::list",
+                "availability::str::[in_stock|pre_order|sold_out]"
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        s.extract_json_structures(&m).unwrap();
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.structures.len(), 1);
+        assert_eq!(info.structures[0].name, "product_info");
+        assert_eq!(info.structures[0].fields.len(), 3);
+        let avail = info.structures[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "availability")
+            .unwrap();
+        assert_eq!(avail.dtype, ValueDtype::Str);
+        assert_eq!(
+            avail.choices.as_deref().unwrap(),
+            &["in_stock", "pre_order", "sold_out"]
+        );
+    }
+
+    #[test]
+    fn introspect_multitask() {
+        let mut s = Schema::new();
+        s.entities(json!(["person"]));
+        s.relations(json!(["works_for"]));
+        s.classification_simple("sentiment", json!(["pos", "neg"]));
+        let (v, _) = s.build();
+        let info = SchemaInfo::from_value(&v);
+        assert_eq!(info.entities.len(), 1);
+        assert_eq!(info.relations.len(), 1);
+        assert_eq!(info.classifications.len(), 1);
+        assert!(info.structures.is_empty());
     }
 }
