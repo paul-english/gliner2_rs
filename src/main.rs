@@ -2,6 +2,8 @@ mod labelstudio;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(feature = "burn")]
+use gliner2::BurnExtractor;
 #[cfg(feature = "candle")]
 use gliner2::CandleExtractor;
 use gliner2::SchemaInfo;
@@ -443,6 +445,8 @@ impl Input {
 
 #[allow(clippy::large_enum_variant)]
 enum Engine {
+    #[cfg(feature = "burn")]
+    Burn(BurnExtractor),
     #[cfg(feature = "candle")]
     Candle(CandleExtractor),
     #[cfg(feature = "tch")]
@@ -738,6 +742,17 @@ fn create_engines(
                 let _ = worker_idx;
                 anyhow::bail!("Backend \"tch\" requires building gliner2 with --features tch");
             }
+        } else if backend == "burn" {
+            #[cfg(feature = "burn")]
+            {
+                let _ = cli;
+                Engine::Burn(BurnExtractor::load_cpu(files, config.clone(), vocab)?)
+            }
+            #[cfg(not(feature = "burn"))]
+            {
+                let _ = cli;
+                anyhow::bail!("Backend \"burn\" requires building gliner2 with --features burn");
+            }
         } else {
             #[cfg(feature = "candle")]
             {
@@ -767,6 +782,15 @@ where
     F: FnMut(usize, Vec<ExtractionOutput>) -> Result<()>,
 {
     match engine {
+        #[cfg(feature = "burn")]
+        Engine::Burn(e) => batch_extract_streaming(
+            e,
+            processor,
+            texts,
+            BatchSchemaMode::Shared { schema, meta },
+            opts,
+            on_batch,
+        ),
         #[cfg(feature = "candle")]
         Engine::Candle(e) => batch_extract_streaming(
             e,
@@ -785,8 +809,8 @@ where
             opts,
             on_batch,
         ),
-        #[cfg(not(any(feature = "candle", feature = "tch")))]
-        _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
+        #[cfg(not(any(feature = "burn", feature = "candle", feature = "tch")))]
+        _ => anyhow::bail!("No backend features (burn, candle, or tch) are enabled."),
     }
 }
 
@@ -855,6 +879,22 @@ where
                 let mut local_results = Vec::with_capacity(worker_texts.len());
 
                 match engine {
+                    #[cfg(feature = "burn")]
+                    Engine::Burn(e) => {
+                        batch_extract_streaming(
+                            e,
+                            processor,
+                            worker_texts,
+                            BatchSchemaMode::Shared { schema, meta },
+                            opts,
+                            |offset, batch| {
+                                for (i, val) in batch.into_iter().enumerate() {
+                                    local_results.push((start + offset + i, val));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
                     #[cfg(feature = "candle")]
                     Engine::Candle(e) => {
                         batch_extract_streaming(
@@ -887,8 +927,8 @@ where
                             },
                         )?;
                     }
-                    #[cfg(not(any(feature = "candle", feature = "tch")))]
-                    _ => anyhow::bail!("No backend features (candle or tch) are enabled."),
+                    #[cfg(not(any(feature = "burn", feature = "candle", feature = "tch")))]
+                    _ => anyhow::bail!("No backend features (burn, candle, or tch) are enabled."),
                 }
 
                 Ok(local_results)

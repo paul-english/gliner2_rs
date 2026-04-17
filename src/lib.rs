@@ -12,6 +12,8 @@ pub mod span_utils;
 pub use config::ExtractorConfig;
 pub use engine::Gliner2Engine;
 
+#[cfg(feature = "burn")]
+pub use backends::burn::BurnExtractor;
 #[cfg(feature = "candle")]
 pub use backends::candle::CandleExtractor;
 #[cfg(feature = "tch")]
@@ -38,6 +40,10 @@ pub use schema::{
 const _: () = {
     fn _assert_send_sync<T: Send + Sync>() {}
 
+    #[cfg(feature = "burn")]
+    fn _check_burn() {
+        _assert_send_sync::<backends::burn::BurnExtractor>();
+    }
     #[cfg(feature = "candle")]
     fn _check_candle() {
         _assert_send_sync::<backends::candle::CandleExtractor>();

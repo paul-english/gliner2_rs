@@ -27,7 +27,7 @@ setup:
 
 # Test all
 test *ARGS:
-    cargo test {{ARGS}}
+    cargo test --all-features {{ARGS}}
 
 bench: build-release
     harness/run_all.sh
