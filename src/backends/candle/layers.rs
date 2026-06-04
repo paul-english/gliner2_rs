@@ -130,11 +130,15 @@ impl TorchEncoderLayer {
         let k = k.reshape((b_sz, seq_len, self.nhead, self.head_dim))?;
         let v = v.reshape((b_sz, seq_len, self.nhead, self.head_dim))?;
 
-        let q = q.permute([0usize, 2, 1, 3])?;
+        // `permute`/`transpose` produce non-contiguous views; Candle's matmul
+        // rejects non-contiguous operands for some stride geometries (the ones
+        // that arise at certain seq lengths). Make each matmul operand
+        // contiguous so attention is robust across all input shapes.
+        let q = q.permute([0usize, 2, 1, 3])?.contiguous()?;
         let k = k.permute([0usize, 2, 1, 3])?;
-        let v = v.permute([0usize, 2, 1, 3])?;
+        let v = v.permute([0usize, 2, 1, 3])?.contiguous()?;
 
-        let k_t = k.transpose(D::Minus1, D::Minus2)?;
+        let k_t = k.transpose(D::Minus1, D::Minus2)?.contiguous()?;
         let scores = q.matmul(&k_t)?;
         let scores = scores.broadcast_mul(&Tensor::new(self.scale as f32, scores.device())?)?;
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
